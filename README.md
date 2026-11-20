@@ -6,7 +6,7 @@ The planned learner follows [SuperMimic](https://github.com/HybridRobotics/super
 
 ## Current status
 
-The repository contains the simulator setup, a right-hand LEAP model, and a fixed-palm cube calibration scene. The smoke checks cover actuation, contact, finite simulation states, and resets. The grasp reset distribution, manipulation tasks, and shared learner integration are upcoming milestones.
+The repository contains the simulator setup, a right-hand LEAP model, a fixed-palm cube calibration scene, and a deterministic cube grasp. The grasp check holds the cube on fingertip contacts, releases it under gravity, and verifies that the rollout repeats exactly after reset. The grasp reset distribution, manipulation tasks, and shared learner integration are upcoming milestones.
 
 ## Run the CPU smoke check
 
@@ -20,6 +20,14 @@ uv run --locked python -m superdex.smoke
 
 The check loads the bundled meshes, tests all 16 position actuators in both directions, and steps a free cube onto the palm. It checks the cube quaternion and verifies that resetting restores the initial state.
 
+## Replay the cube grasp
+
+```bash
+uv run --locked python -m superdex.grasp --trace grasp.csv
+```
+
+The headless check uses CPU MuJoCo. The optional CSV records joint positions, cube pose in MuJoCo's scalar-first quaternion order, and fingertip contact flags during the two-second hold and subsequent release.
+
 ## Set up the upstream training environment
 
 The Linux setup script uses pinned official SuperMimic and `mjlab_research` revisions in `.upstream/` and installs the packages in SuperMimic's lockfile. It creates a second virtual environment so the CPU smoke check stays lightweight. The training lock includes several gigabytes of CUDA packages.
@@ -31,14 +39,15 @@ PYTHONPATH=src .upstream/supermimic/.venv/bin/python -m superdex.smoke --mjlab-d
 .upstream/supermimic/.venv/bin/python -m supermimic.scripts.train SuperMimic-GenCoord-G1 --help
 ```
 
-On a Linux host with a compatible NVIDIA driver, use the same setup and exercise the bounded MuJoCo Warp check on the selected GPU.
+On a Linux host with a compatible NVIDIA driver, use the same setup and run the bounded MuJoCo Warp checks on the selected GPU.
 
 ```bash
 # GPU simulation check
 PYTHONPATH=src .upstream/supermimic/.venv/bin/python -m superdex.smoke --mjlab-device cuda:0
+PYTHONPATH=src .upstream/supermimic/.venv/bin/python -m superdex.grasp --mjlab-device cuda:0 --mjlab-envs 32
 ```
 
-The official G1 baseline requires a compatible retargeted motion clip. Its smoke run is the next training milestone, followed by a stable cube grasp reset and the first yaw-rotation experiment.
+The official G1 baseline requires a compatible retargeted motion clip. The first Superdex training experiment will use the LEAP cube grasp reset for yaw rotation.
 
 ## Credits
 

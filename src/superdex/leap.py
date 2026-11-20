@@ -63,3 +63,12 @@ def calibration_spec() -> mujoco.MjSpec:
     spec = leap_spec()
     spec.attach(cube_spec(), prefix="cube/", frame=spec.worldbody.add_frame())
     return spec
+
+
+def grasp_spec() -> mujoco.MjSpec:
+    """Mount the fixed palm sideways so opening the fingers lets the cube fall."""
+    spec = calibration_spec()
+    palm = spec.body("palm")
+    palm.pos = (0.0, 0.0, 0.25)
+    palm.quat = (2**-0.5, 2**-0.5, 0.0, 0.0)
+    return spec
