@@ -1,0 +1,9 @@
+/SUPERDEX.md
+/.upstream/
+/.venv/
+/dist/
+/outputs/
+/logs/
+__pycache__/
+.pytest_cache/
+.ruff_cache/

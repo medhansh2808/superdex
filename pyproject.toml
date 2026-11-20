@@ -1,0 +1,18 @@
+[build-system]
+requires = ["uv_build==0.13.7"]
+build-backend = "uv_build"
+
+[project]
+name = "superdex"
+version = "0.1.0"
+description = "Multi-task dexterous manipulation through differentiable world models"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "mujoco-core==4.0.1",
+    "numpy==2.4.2",
+]
+
+[tool.uv.build-backend]
+source-include = [".python-version", "scripts/setup-upstream.sh", "uv.lock"]
+source-exclude = ["SUPERDEX.md", ".upstream/**", ".venv/**", "dist/**", "logs/**", "outputs/**"]
