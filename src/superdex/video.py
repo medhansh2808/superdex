@@ -15,6 +15,7 @@ from superdex.leap import grasp_spec
 class EvaluationClips:
     def __init__(self, env):
         self.slots = [0, 1, env.num_envs // 2]
+        self.cube_mm = env.cube_mm
         self.dt = env.dt
         self.frames = []
         self.origin = env.origin[:3].cpu().numpy()
@@ -28,7 +29,7 @@ class EvaluationClips:
 
     def write(self, directory: Path):
         directory.mkdir(parents=True, exist_ok=True)
-        model = grasp_spec().compile()
+        model = grasp_spec(self.cube_mm).compile()
         # Brighten the dark hand material on the render-only model.
         model.mat_rgba[model.material("black").id, :3] = (0.43, 0.46, 0.50)
         model.vis.headlight.ambient[:] = 0.55

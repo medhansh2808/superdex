@@ -80,12 +80,13 @@ class CubeManipulation:
 
     def __init__(
         self, num_envs: int, device: str, *, angular_velocity_loss: bool = True,
-        yaw_reward: str = "clipped",
+        yaw_reward: str = "clipped", cube_mm: int = 36,
     ) -> None:
+        self.cube_mm = cube_mm
         self.yaw_reward = yaw_reward
         self.num_envs = num_envs
         self.device = device
-        model = grasp_spec().compile()
+        model = grasp_spec(cube_mm).compile()
         fixture = mujoco.MjData(model)
         reset_grasp(model, fixture)
         self.sim = Simulation(

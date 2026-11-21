@@ -27,6 +27,20 @@ _GRASP_CUBE_POSE = (
     -0.0141737, 0.1091255, 0.2275260,
     0.9705113, -0.1466234, -0.1716994, -0.0844320,
 )
+# Settled four-finger reset from the 42 mm, 50 g preview rollout.
+_FOUR_FINGER_JOINTS = (
+    0.70702249, 0.02405058, 0.82643424, 0.52742325,
+    0.83107760, -0.03090370, 0.48312380, 0.58658065,
+    1.04045295, -0.33314500, 0.92394194, 0.32210611,
+    1.23933368, 1.01703649, 0.66169056, 0.61352567,
+)
+_FOUR_FINGER_TARGETS = (
+    *_GRASP_TARGETS[:8], 1.04644161, -0.35665372, 0.92350904, 0.32259802, *_GRASP_TARGETS[12:],
+)
+_FOUR_FINGER_CUBE_POSE = (
+    -0.0127527643, 0.1089376904, 0.2278207899,
+    0.9640271150, -0.1866893753, -0.1699634375, -0.0831337989,
+)
 _TIP_NAMES = ("if_tip", "mf_tip", "rf_tip", "th_tip")
 _HOLD_SECONDS = 2.0
 _RELEASE_SECONDS = 0.8
@@ -45,9 +59,12 @@ def reset_grasp(model: mujoco.MjModel, data: mujoco.MjData) -> None:
     cube_address = model.joint("cube/free").qposadr.item()
 
     mujoco.mj_resetData(model, data)
-    data.qpos[joint_addresses] = _GRASP_JOINTS
-    data.ctrl[actuator_ids] = _GRASP_TARGETS
-    data.qpos[cube_address : cube_address + 7] = _GRASP_CUBE_POSE
+    joints, targets, pose = _GRASP_JOINTS, _GRASP_TARGETS, _GRASP_CUBE_POSE
+    if np.isclose(model.geom("cube/surface").size[0], 0.021):
+        joints, targets, pose = _FOUR_FINGER_JOINTS, _FOUR_FINGER_TARGETS, _FOUR_FINGER_CUBE_POSE
+    data.qpos[joint_addresses] = joints
+    data.ctrl[actuator_ids] = targets
+    data.qpos[cube_address : cube_address + 7] = pose
     mujoco.mj_normalizeQuat(model, data.qpos)
     mujoco.mj_forward(model, data)
 
@@ -86,8 +103,8 @@ def _rollout(model: mujoco.MjModel, data: mujoco.MjData) -> tuple[np.ndarray, in
     return np.stack(rows), hold_samples
 
 
-def check_grasp(trace_path: Path | None = None) -> None:
-    model = grasp_spec().compile()
+def check_grasp(trace_path: Path | None = None, cube_mm: int = 36) -> None:
+    model = grasp_spec(cube_mm).compile()
     data = mujoco.MjData(model)
     trace, hold_samples = _rollout(model, data)
     repeated, _ = _rollout(model, data)
@@ -104,6 +121,8 @@ def check_grasp(trace_path: Path | None = None) -> None:
             writer.writerow(_TRACE_COLUMNS)
             writer.writerows(trace)
 
+    if cube_mm == 42 and not np.all(hold[:, -4:]):
+        raise RuntimeError("42 mm grasp lost fingertip contact during the hold")
     if drift > _MAX_HOLD_DRIFT or not np.all(supported[1:]):
         raise RuntimeError(f"Cube grasp was unstable over the hold (drift {drift:.3f} m)")
     if drop < _MIN_RELEASE_DROP or np.any(trace[-1, -4:]):
@@ -118,7 +137,7 @@ def check_grasp(trace_path: Path | None = None) -> None:
     )
 
 
-def check_mjlab_grasp(device: str, num_envs: int) -> None:
+def check_mjlab_grasp(device: str, num_envs: int, cube_mm: int = 36) -> None:
     """Verify that batched worlds can hold and release the same grasp independently."""
     import torch
     from mjlab.sim import Simulation
@@ -128,7 +147,7 @@ def check_mjlab_grasp(device: str, num_envs: int) -> None:
     if num_envs < 2:
         raise ValueError("The independent release check requires at least two worlds")
 
-    model = grasp_spec().compile()
+    model = grasp_spec(cube_mm).compile()
     data = mujoco.MjData(model)
     reset_grasp(model, data)
     sim = Simulation(num_envs=num_envs, cfg=leap_simulation_cfg(), model=model, device=device)
@@ -188,10 +207,11 @@ def main() -> None:
     parser.add_argument("--trace", type=Path, help="Write joint, cube and contact samples to CSV")
     parser.add_argument("--mjlab-device", help="Also check batched grasps on cpu or CUDA")
     parser.add_argument("--mjlab-envs", type=int, default=2, help="Number of mjlab worlds")
+    parser.add_argument("--cube-mm", choices=(36, 42), type=int, default=36)
     args = parser.parse_args()
-    check_grasp(args.trace)
+    check_grasp(args.trace, args.cube_mm)
     if args.mjlab_device:
-        check_mjlab_grasp(args.mjlab_device, args.mjlab_envs)
+        check_mjlab_grasp(args.mjlab_device, args.mjlab_envs, args.cube_mm)
 
 
 if __name__ == "__main__":

@@ -33,14 +33,17 @@ def leap_spec() -> mujoco.MjSpec:
     return mujoco.MjSpec.from_file(str(_LEAP_MJCF))
 
 
-def cube_spec() -> mujoco.MjSpec:
+def cube_spec(cube_mm: int = 36) -> mujoco.MjSpec:
+    if cube_mm not in (36, 42):
+        raise ValueError(f"No calibrated grasp for a {cube_mm} mm cube")
+    half_edge = cube_mm / 2000
     spec = mujoco.MjSpec()
     cube = spec.worldbody.add_body(name="object", pos=CUBE_START_POSITION)
     cube.add_freejoint(name="free")
     cube.add_geom(
         name="surface",
         type=mujoco.mjtGeom.mjGEOM_BOX,
-        size=(0.018, 0.018, 0.018),
+        size=(half_edge,) * 3,
         mass=0.05,
         friction=(0.8, 0.005, 0.0001),
         rgba=(0.16, 0.45, 0.66, 1.0),
@@ -49,7 +52,7 @@ def cube_spec() -> mujoco.MjSpec:
         name="mark",
         type=mujoco.mjtGeom.mjGEOM_BOX,
         size=(0.004, 0.003, 0.0002),
-        pos=(0.008, -0.005, 0.018),
+        pos=(0.008, -0.005, half_edge),
         mass=0.0,
         contype=0,
         conaffinity=0,
@@ -58,16 +61,16 @@ def cube_spec() -> mujoco.MjSpec:
     return spec
 
 
-def calibration_spec() -> mujoco.MjSpec:
+def calibration_spec(cube_mm: int = 36) -> mujoco.MjSpec:
     """Place a free cube above the neutral palm for contact and reset checks."""
     spec = leap_spec()
-    spec.attach(cube_spec(), prefix="cube/", frame=spec.worldbody.add_frame())
+    spec.attach(cube_spec(cube_mm), prefix="cube/", frame=spec.worldbody.add_frame())
     return spec
 
 
-def grasp_spec() -> mujoco.MjSpec:
+def grasp_spec(cube_mm: int = 36) -> mujoco.MjSpec:
     """Mount the fixed palm sideways so opening the fingers lets the cube fall."""
-    spec = calibration_spec()
+    spec = calibration_spec(cube_mm)
     palm = spec.body("palm")
     palm.pos = (0.0, 0.0, 0.25)
     palm.quat = (2**-0.5, 2**-0.5, 0.0, 0.0)

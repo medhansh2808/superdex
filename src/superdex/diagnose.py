@@ -16,8 +16,9 @@ HORIZONS = (1, 4, 8, 32)
 
 
 @torch.no_grad()
-def diagnose(checkpoint: Path, env: CubeManipulation) -> None:
-    weights = torch.load(checkpoint, weights_only=True, map_location=env.device)
+def diagnose(checkpoint: Path, num_envs: int, device: str) -> None:
+    weights = torch.load(checkpoint, weights_only=True, map_location=device)
+    env = CubeManipulation(num_envs, device, cube_mm=weights.get("cube_mm", 36))
     actor = _make_actor(env).eval()
     actor.load_state_dict(weights["actor"])
     dynamics = _make_dynamics(env).eval()
@@ -95,7 +96,7 @@ def main() -> None:
         parser.error("--envs must be a positive multiple of four")
     if args.device == "cpu":
         torch.set_num_threads(min(4, torch.get_num_threads()))
-    diagnose(args.checkpoint, CubeManipulation(args.envs, args.device))
+    diagnose(args.checkpoint, args.envs, args.device)
 
 
 if __name__ == "__main__":

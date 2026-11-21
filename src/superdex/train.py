@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import torch
 from supermimic.learners.policy_learner import (
@@ -386,7 +387,7 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
     if args.report_every and args.report_every < iterations:
         eval_env = CubeManipulation(
             env.num_envs, env.device, angular_velocity_loss=args.world_model_loss == "angular-velocity",
-            yaw_reward=env.yaw_reward,
+            yaw_reward=env.yaw_reward, cube_mm=env.cube_mm,
         )
 
     torch.manual_seed(args.seed + 1)
@@ -408,6 +409,20 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
     world_learner = WorldModelLearner(dynamics, env.rep, world_cfg, device=env.device)
     imagined = ImaginedManipulation(env, dynamics)
     actor_learner = ActorCriticPolicyLearner(actor, critic, imagined, actor_cfg, device=env.device)
+    def save_checkpoint(path: Path, iteration: int) -> None:
+        weights = {
+            "actor": actor.state_dict(), "dynamics": dynamics.state_dict(), "critic": critic.state_dict(),
+            "iteration": iteration, "cube_mm": env.cube_mm, "seed": args.seed,
+            "actor_horizon": actor_horizon, "policy_noise_std": args.policy_noise_std,
+            "world_model_loss": args.world_model_loss, "yaw_reward": args.yaw_reward,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(dir=path.parent) as tmp:
+            staged = Path(tmp) / "checkpoint.pt"
+            torch.save(weights, staged)
+            path.hardlink_to(staged)
+        print(f"Saved {path}", flush=True)
+
     _log("untrained_policy", evaluate(env, actor, eval_steps))
 
     replay = JointReplay(env, 256 if smoke else 1024)
@@ -447,16 +462,14 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
                 with torch.random.fork_rng(devices=devices):
                     _log("intermediate_policy", {"iteration": i, **evaluate(eval_env, actor, eval_steps)})
 
+                if args.save_reports:
+                    name = f"{args.output.stem}-iter{i:04d}{args.output.suffix}"
+                    save_checkpoint(args.output.with_name(name), i)
+
     _log("world_model_heldout_after", _world_model_errors(env, dynamics, validation))
     _log("trained_policy", evaluate(env, actor, eval_steps))
     if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        with args.output.open("xb") as file:
-            torch.save({"actor": actor.state_dict(), "dynamics": dynamics.state_dict(),
-                        "critic": critic.state_dict(), "seed": args.seed, "actor_horizon": actor_horizon,
-                        "policy_noise_std": args.policy_noise_std,
-                        "world_model_loss": args.world_model_loss, "yaw_reward": args.yaw_reward}, file)
-        print(f"Saved {args.output}", flush=True)
+        save_checkpoint(args.output, iterations)
 
 
 def main() -> None:
@@ -477,7 +490,13 @@ def main() -> None:
     parser.add_argument("--output", type=Path, help="Write a new checkpoint at this path")
     parser.add_argument("--evaluate", type=Path, help="Evaluate one checkpoint on both tasks")
     parser.add_argument("--video-dir", type=Path, help="Export three MP4s during checkpoint evaluation")
+    parser.add_argument("--cube-mm", type=int, choices=(36, 42),
+                        help="Training cube edge length (default 36 mm); evaluation uses checkpoint geometry")
+    parser.add_argument("--save-reports", action="store_true",
+                        help="Save the actor, world model and critic at every intermediate evaluation")
     args = parser.parse_args()
+    if args.save_reports and (not args.output or not args.report_every or args.evaluate):
+        parser.error("--save-reports requires training with --output and --report-every")
     if args.video_dir and not args.evaluate:
         parser.error("--video-dir requires --evaluate")
     if not math.isfinite(args.policy_noise_std) or args.policy_noise_std < 0:
@@ -501,13 +520,19 @@ def main() -> None:
         torch.compiler.set_stance("force_eager")
     if args.device == "cpu":
         torch.set_num_threads(min(4, torch.get_num_threads()))
-    env = CubeManipulation(
-        args.envs, args.device, angular_velocity_loss=args.world_model_loss == "angular-velocity",
-        yaw_reward=args.yaw_reward,
-    )
-    print(f"{args.device}: {args.envs // 2} worlds per skill, {env.dt:.3f} s control step", flush=True)
+    checkpoint = None
+    cube_mm = args.cube_mm or 36
     if args.evaluate:
         checkpoint = torch.load(args.evaluate, map_location=args.device, weights_only=True)
+        cube_mm = checkpoint.get("cube_mm", 36)
+        if args.cube_mm is not None and args.cube_mm != cube_mm:
+            parser.error(f"checkpoint uses a {cube_mm} mm cube")
+    env = CubeManipulation(
+        args.envs, args.device, angular_velocity_loss=args.world_model_loss == "angular-velocity",
+        yaw_reward=args.yaw_reward, cube_mm=cube_mm,
+    )
+    print(f"{args.device}: {cube_mm} mm cube, {args.envs // 2} worlds per skill, {env.dt:.3f} s control step", flush=True)
+    if checkpoint is not None:
         actor = _make_actor(env)
         actor.load_state_dict(checkpoint["actor"])
         capture = None
