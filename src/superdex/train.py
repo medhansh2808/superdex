@@ -315,7 +315,8 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
     dynamics = _make_dynamics(env)
     critic = build_mlp(env.rep.rep_state_dim + NUM_ACTIONS + 5, (256, 128), 1).to(env.device)
     world_cfg = WorldModelLearnerCfg(
-        horizon=MODEL_HORIZON, batch_size=batch_size, num_batches=1 if smoke else 10
+        horizon=MODEL_HORIZON, batch_size=batch_size, num_batches=1 if smoke else 10,
+        nominal_error_body_avel=1.0,  # rad/s, the evaluation yaw command magnitude
     )
     actor_horizon = args.actor_horizon or (4 if smoke else 32)
     actor_cfg = ActorCriticPolicyLearnerCfg(batch_size=batch_size, horizon=actor_horizon)

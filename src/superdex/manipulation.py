@@ -36,6 +36,11 @@ def orientation_error(quat: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
 class HandCubeRepresentation(GenCoordRepresentation):
     """Treat the cube as the free body in SuperMimic's integrated representation."""
 
+    LOSS_WEIGHT_CONFIG = {
+        **GenCoordRepresentation.LOSS_WEIGHT_CONFIG,
+        "cube_angular_velocity": "nominal_error_body_avel",
+    }
+
     def __init__(self, joint_targets: torch.Tensor, dt: float) -> None:
         super().__init__(NUM_ACTIONS, joint_targets)
         self.dt = dt
@@ -57,7 +62,10 @@ class HandCubeRepresentation(GenCoordRepresentation):
         return super().reconstruct_full_state(aux_state, rep_state[..., : self._base_dim])
 
     def loss_blocks(self, rep_state, aux_state):
-        return super().loss_blocks(rep_state[..., : self._base_dim], aux_state)
+        blocks = super().loss_blocks(rep_state[..., : self._base_dim], aux_state)
+        full_state = self.reconstruct_full_state(aux_state, rep_state)
+        blocks["cube_angular_velocity"] = full_state[..., CUBE_ANGULAR_VELOCITY]
+        return blocks
 
 
 class CubeManipulation:
