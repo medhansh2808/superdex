@@ -6,7 +6,7 @@ The planned learner follows [SuperMimic](https://github.com/HybridRobotics/super
 
 ## Current status
 
-The repository contains the simulator setup, a right-hand LEAP model, a fixed-palm cube calibration scene, and a deterministic cube grasp. The grasp check holds the cube on fingertip contacts, releases it under gravity, and verifies that the rollout repeats exactly after reset. The grasp reset distribution, manipulation tasks, and shared learner integration are upcoming milestones.
+The repository contains the simulator setup, a right-hand LEAP model, a fixed-palm cube calibration scene, and a deterministic cube grasp. The grasp check holds the cube on fingertip contacts, releases it under gravity, and verifies that the rollout repeats exactly after reset. Continuous yaw and 3D reorientation are wired into one shared learner. The short run checks integration and reports per-skill results in MuJoCo Warp.
 
 ## Run the CPU smoke check
 
@@ -47,7 +47,18 @@ PYTHONPATH=src .upstream/supermimic/.venv/bin/python -m superdex.smoke --mjlab-d
 PYTHONPATH=src .upstream/supermimic/.venv/bin/python -m superdex.grasp --mjlab-device cuda:0 --mjlab-envs 32
 ```
 
-The official G1 baseline requires a compatible retargeted motion clip. The first Superdex training experiment will use the LEAP cube grasp reset for yaw rotation.
+## Joint training smoke test
+
+Run this from the Superdex root with the CUDA-capable SuperMimic virtualenv active. The pinned source checkouts under .upstream come from the setup step above. When using a working baseline virtualenv, the command below uses its installed dependencies and the pinned source trees.
+
+```bash
+export PYTHONPATH="$PWD/src:$PWD/.upstream/supermimic/src:$PWD/.upstream/mjlab_research/src"
+python -u -m superdex.train --device cuda:0 --smoke
+```
+
+The short run uses four worlds and two learner updates. It checks both rewards and drop detection, fits the shared dynamics from contiguous eight-step simulator trajectories, and checks that later imagined rewards send gradients to the first action for both skills. It prints held-out world-model errors and untrained and trained policy metrics. To save a shared checkpoint, add `--output outputs/joint-smoke.pt`. Evaluate both skills from the same actor with `--evaluate outputs/joint-smoke.pt` without `--smoke`.
+
+The learner imports the pinned official SuperMimic dynamics, world-model update, multi-encoder actor and BPTT actor-critic update. The LEAP adapter uses the calibrated grasp, cube pose and velocity from the simulator, ±0.35 rad position offsets, and fixed physics parameters. The final actor layer starts near zero so its initial actions stay close to the grasp. The smoke test uses four imagined steps and a small batch. The regular run uses the original eight-step model and 32-step actor horizons. The smoke test verifies the training loop. Skill performance is measured in MuJoCo Warp over longer runs.
 
 ## Credits
 
