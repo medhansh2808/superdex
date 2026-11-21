@@ -36,6 +36,7 @@ GOAL_KEYS = ("task_id", *TASKS)
 MODEL_HORIZON = 8
 REORIENTATION_TOLERANCE = math.radians(15)
 EPISODE_SECONDS = 3
+DEFAULT_NOISE_STD = 0.2
 
 
 class JointReplay:
@@ -78,6 +79,7 @@ class YawCoverage:
         self.angle = env.origin.new_zeros(env.num_envs)
         self.windows = []
         self.cut_short = []
+        self.drops = []
 
     def update(self, rate, command, dropped, timed_out) -> None:
         self.age += 1
@@ -87,6 +89,7 @@ class YawCoverage:
         # Keep fixed shapes on the GPU until the report, avoiding per-step syncs.
         self.windows.append(torch.where(complete, torch.rad2deg(self.angle), torch.nan))
         self.cut_short.append(ended & ~complete)
+        self.drops.append(dropped)
         self.commands = command.sign()
         restart = complete | ended
         self.age.masked_fill_(restart, 0)
@@ -95,6 +98,7 @@ class YawCoverage:
     def report(self) -> dict:
         angles = torch.stack(self.windows)
         partials = torch.stack(self.cut_short)
+        drops = torch.stack(self.drops)
         result = {"window_s": self.window_steps * self.dt, "threshold_deg": 5.0}
         # Command magnitudes can change on reset. The sign is fixed per world.
         for name, sign in (("positive", 1), ("negative", -1)):
@@ -104,12 +108,14 @@ class YawCoverage:
             result[name] = {
                 "held_windows": held.numel(),
                 "interrupted_windows": partials[:, slots].sum().item(),
+                "dropped_windows": drops[:, slots].sum().item(),
                 "with_command_ge_5deg": (held >= 5).sum().item(),
                 "against_command_ge_5deg": (held <= -5).sum().item(),
                 "mean_signed_deg": held.mean().item() if held.numel() else None,
             }
         self.windows.clear()
         self.cut_short.clear()
+        self.drops.clear()
         return result
 
 
@@ -125,7 +131,8 @@ class Collector:
 
     @torch.no_grad()
     def collect(
-        self, steps: int, replay: JointReplay, actor: MultiEncoderAE | None = None
+        self, steps: int, replay: JointReplay, actor: MultiEncoderAE | None = None,
+        *, noise_std: float = DEFAULT_NOISE_STD,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if actor is not None:
             actor.eval()
@@ -133,7 +140,7 @@ class Collector:
         states = []
         actions = []
         for _ in range(steps):
-            noise = 0.2 * torch.randn_like(self.prev_action)
+            noise = noise_std * torch.randn_like(self.prev_action)
             if actor is None:
                 action = 0.75 * self.prev_action + noise
             else:
@@ -369,6 +376,7 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
     eval_steps = args.eval_steps or (20 if smoke else 150)
     iterations = args.iterations or (2 if smoke else 100)
     _log("objectives", {"yaw_reward": args.yaw_reward, "world_model_loss": args.world_model_loss})
+    _log("collection", {"policy_noise_std": args.policy_noise_std, "warmup_noise_std": DEFAULT_NOISE_STD})
     verify_task_rewards(env)
     print("Yaw, reorientation, and cube-drop reward checks passed.", flush=True)
 
@@ -426,7 +434,7 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
         policy_stats = actor_learner.update([starts])
         if env.yaw_reward == "huber":
             policy_stats["Policy/old_flat_yaw_fraction"] = imagined.old_flat_fraction_sum / actor_horizon
-        states, actions = collector.collect(collect_steps, replay, actor)
+        states, actions = collector.collect(collect_steps, replay, actor, noise_std=args.policy_noise_std)
         world_learner.update_normalization(states, actions)
         stats = {k: v.item() for k, v in (model_stats | policy_stats).items()}
         _log(f"iteration {i}/{iterations}", stats)
@@ -444,6 +452,7 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
         with args.output.open("xb") as file:
             torch.save({"actor": actor.state_dict(), "dynamics": dynamics.state_dict(),
                         "critic": critic.state_dict(), "seed": args.seed, "actor_horizon": actor_horizon,
+                        "policy_noise_std": args.policy_noise_std,
                         "world_model_loss": args.world_model_loss, "yaw_reward": args.yaw_reward}, file)
         print(f"Saved {args.output}", flush=True)
 
@@ -454,6 +463,8 @@ def main() -> None:
     parser.add_argument("--envs", type=int)
     parser.add_argument("--iterations", type=int)
     parser.add_argument("--eval-steps", type=int)
+    parser.add_argument("--policy-noise-std", type=float, default=DEFAULT_NOISE_STD,
+                        help="Gaussian noise standard deviation in normalized policy actions during collection")
     parser.add_argument("--report-every", type=int, metavar="N",
                         help="Report real replay yaw coverage and evaluate the policy every N iterations")
     parser.add_argument("--actor-horizon", type=int, help="Imagined control steps per actor update")
@@ -464,6 +475,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, help="Write a new checkpoint at this path")
     parser.add_argument("--evaluate", type=Path, help="Evaluate one checkpoint on both tasks")
     args = parser.parse_args()
+    if not math.isfinite(args.policy_noise_std) or args.policy_noise_std < 0:
+        parser.error("--policy-noise-std must be finite and nonnegative")
     if args.envs is None:
         args.envs = 4 if args.smoke else 64
     if args.envs < 4 or args.envs % 4:
