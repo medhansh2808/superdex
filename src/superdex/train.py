@@ -317,7 +317,9 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
     world_cfg = WorldModelLearnerCfg(
         horizon=MODEL_HORIZON, batch_size=batch_size, num_batches=1 if smoke else 10
     )
-    actor_cfg = ActorCriticPolicyLearnerCfg(batch_size=batch_size, horizon=4 if smoke else 32)
+    actor_horizon = args.actor_horizon or (4 if smoke else 32)
+    actor_cfg = ActorCriticPolicyLearnerCfg(batch_size=batch_size, horizon=actor_horizon)
+    _log("rollout_horizons", {"actor": actor_horizon, "world_model": MODEL_HORIZON})
     world_learner = WorldModelLearner(dynamics, env.rep, world_cfg, device=env.device)
     imagined = ImaginedManipulation(env, dynamics)
     actor_learner = ActorCriticPolicyLearner(actor, critic, imagined, actor_cfg, device=env.device)
@@ -356,7 +358,7 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("xb") as file:
             torch.save({"actor": actor.state_dict(), "dynamics": dynamics.state_dict(),
-                        "critic": critic.state_dict(), "seed": args.seed}, file)
+                        "critic": critic.state_dict(), "seed": args.seed, "actor_horizon": actor_horizon}, file)
         print(f"Saved {args.output}", flush=True)
 
 
@@ -366,6 +368,7 @@ def main() -> None:
     parser.add_argument("--envs", type=int)
     parser.add_argument("--iterations", type=int)
     parser.add_argument("--eval-steps", type=int)
+    parser.add_argument("--actor-horizon", type=int, help="Imagined control steps per actor update")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smoke", action="store_true", help="Run a bounded end-to-end check")
     parser.add_argument("--output", type=Path, help="Write a new checkpoint at this path")
@@ -377,6 +380,8 @@ def main() -> None:
         parser.error("--envs must be a positive multiple of four")
     if args.iterations is not None and args.iterations < 1:
         parser.error("--iterations must be positive")
+    if args.actor_horizon is not None and args.actor_horizon < 1:
+        parser.error("--actor-horizon must be positive")
     if args.eval_steps is not None and args.eval_steps < 1:
         parser.error("--eval-steps must be positive")
     if args.output is not None and args.output.exists():
