@@ -33,6 +33,10 @@ def orientation_error(quat: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
     return 2 * torch.atan2(sine, delta[..., 0].abs())
 
 
+def signed_yaw_rate(state: torch.Tensor, command: torch.Tensor) -> torch.Tensor:
+    return state[..., CUBE_YAW_RATE] * command.sign() / command.abs().clamp_min(0.75)
+
+
 class HandCubeRepresentation(GenCoordRepresentation):
     """Treat the cube as the free body in SuperMimic's integrated representation."""
 
@@ -41,8 +45,10 @@ class HandCubeRepresentation(GenCoordRepresentation):
         "cube_angular_velocity": "nominal_error_body_avel",
     }
 
-    def __init__(self, joint_targets: torch.Tensor, dt: float) -> None:
+    def __init__(self, joint_targets: torch.Tensor, dt: float, *, angular_velocity_loss: bool = True) -> None:
         super().__init__(NUM_ACTIONS, joint_targets)
+        if not angular_velocity_loss:
+            self.LOSS_WEIGHT_CONFIG = GenCoordRepresentation.LOSS_WEIGHT_CONFIG
         self.dt = dt
         self.substep_coeff = (DECIMATION + 1) / (2 * DECIMATION)
         self._base_dim = self.rep_state_dim
@@ -63,15 +69,20 @@ class HandCubeRepresentation(GenCoordRepresentation):
 
     def loss_blocks(self, rep_state, aux_state):
         blocks = super().loss_blocks(rep_state[..., : self._base_dim], aux_state)
-        full_state = self.reconstruct_full_state(aux_state, rep_state)
-        blocks["cube_angular_velocity"] = full_state[..., CUBE_ANGULAR_VELOCITY]
+        if "cube_angular_velocity" in self.LOSS_WEIGHT_CONFIG:
+            full_state = self.reconstruct_full_state(aux_state, rep_state)
+            blocks["cube_angular_velocity"] = full_state[..., CUBE_ANGULAR_VELOCITY]
         return blocks
 
 
 class CubeManipulation:
     """Batched LEAP worlds with privileged object pose and velocity observations."""
 
-    def __init__(self, num_envs: int, device: str) -> None:
+    def __init__(
+        self, num_envs: int, device: str, *, angular_velocity_loss: bool = True,
+        yaw_reward: str = "clipped",
+    ) -> None:
+        self.yaw_reward = yaw_reward
         self.num_envs = num_envs
         self.device = device
         model = grasp_spec().compile()
@@ -102,7 +113,9 @@ class CubeManipulation:
             (ranges - self.action_offset[:, None]) / ACTION_SCALE
         ).clamp(-1, 1).unbind(-1)
         self.origin = self._reset_pos[self._cube_pose]
-        self.rep = HandCubeRepresentation(self.action_offset, self.dt)
+        self.rep = HandCubeRepresentation(
+            self.action_offset, self.dt, angular_velocity_loss=angular_velocity_loss
+        )
         self.ids = torch.arange(num_envs, device=device)
         self.task_id = (self.ids >= num_envs // 2).long()
 
@@ -181,10 +194,15 @@ class CubeManipulation:
         imagined: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         command = goals["yaw"].squeeze(-1)
-        signed_rate = (
-            next_state[..., CUBE_YAW_RATE] * command.sign() / command.abs().clamp_min(0.75)
-        )
-        spin = signed_rate.clamp(-1, 1) - 0.1 * (signed_rate - 1).abs().clamp(max=2)
+        signed_rate = signed_yaw_rate(next_state, command)
+        if self.yaw_reward == "huber":
+            # Match the clipped reward at rest (-0.1) and at the target (1).
+            error = torch.nn.functional.huber_loss(
+                signed_rate, torch.ones_like(signed_rate), reduction="none"
+            )
+            spin = 1 - 2.2 * error
+        else:
+            spin = signed_rate.clamp(-1, 1) - 0.1 * (signed_rate - 1).abs().clamp(max=2)
         old_error = orientation_error(state[..., CUBE_ORIENTATION], goals["reorient"])
         new_error = orientation_error(next_state[..., CUBE_ORIENTATION], goals["reorient"])
         progress = ((old_error - new_error) / (2 * self.dt)).clamp(-1, 1)

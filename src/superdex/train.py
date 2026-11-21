@@ -28,6 +28,7 @@ from superdex.manipulation import (
     CubeManipulation,
     observations,
     orientation_error,
+    signed_yaw_rate,
     verify_task_rewards,
 )
 
@@ -132,8 +133,10 @@ class ImaginedManipulation:
         self.dynamics = dynamics
         self.representation = env.rep
         self.max_step_reward = 1.15 * env.dt
+        self.old_flat_fraction_sum = env.origin.new_zeros(())
 
     def reset(self, start: TensorDict) -> TensorDict:
+        self.old_flat_fraction_sum.zero_()
         self.state = start["state"]
         self.aux = self.representation.extract_aux_state(self.state)
         self.rep_state = self.representation.represent(self.state)
@@ -151,6 +154,11 @@ class ImaginedManipulation:
         reward, done = self.env.score(
             self.state, next_state, action, self.prev_action, self.goals, imagined=True
         )
+        if self.env.yaw_reward == "huber":
+            command = self.goals["yaw"].squeeze(-1)
+            rate = signed_yaw_rate(next_state.detach(), command)
+            flat = (rate < -1) | (rate > 3)
+            self.old_flat_fraction_sum.add_(flat.sum() / (command != 0).sum().clamp_min(1))
         self.state, self.prev_action = next_state, action
         return observations(self.rep_state, action, self.goals), reward, done
 
@@ -283,6 +291,13 @@ def evaluate(env: CubeManipulation, actor: MultiEncoderAE, steps: int) -> dict:
             "signed_rad_s_while_held": (yaw[spin].sum() /
                                         (env.dt * survived_steps[spin].sum().clamp_min(1))).item(),
             "drop_rate": (~alive[spin]).float().mean().item(),
+            "by_command": {
+                name: {
+                    "signed_rotation_deg": torch.rad2deg(yaw[slots].mean()).item(),
+                    "drop_rate": (~alive[slots]).float().mean().item(),
+                }
+                for name, slots in (("positive", direction > 0), ("negative", direction < 0))
+            },
         },
         "reorient": {
             "success_rate": successes.sum().item() / tilt.sum().item(),
@@ -302,6 +317,7 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
     warmup_steps = 24 if smoke else 64
     eval_steps = args.eval_steps or (20 if smoke else 150)
     iterations = args.iterations or (2 if smoke else 100)
+    _log("objectives", {"yaw_reward": args.yaw_reward, "world_model_loss": args.world_model_loss})
     verify_task_rewards(env)
     print("Yaw, reorientation, and cube-drop reward checks passed.", flush=True)
 
@@ -348,6 +364,8 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
                 observations(env.rep.represent(starts["state"]), starts["prev_action"], starts)
             )
         policy_stats = actor_learner.update([starts])
+        if env.yaw_reward == "huber":
+            policy_stats["Policy/old_flat_yaw_fraction"] = imagined.old_flat_fraction_sum / actor_horizon
         states, actions = collector.collect(collect_steps, replay, actor)
         world_learner.update_normalization(states, actions)
         stats = {k: v.item() for k, v in (model_stats | policy_stats).items()}
@@ -359,7 +377,8 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("xb") as file:
             torch.save({"actor": actor.state_dict(), "dynamics": dynamics.state_dict(),
-                        "critic": critic.state_dict(), "seed": args.seed, "actor_horizon": actor_horizon}, file)
+                        "critic": critic.state_dict(), "seed": args.seed, "actor_horizon": actor_horizon,
+                        "world_model_loss": args.world_model_loss, "yaw_reward": args.yaw_reward}, file)
         print(f"Saved {args.output}", flush=True)
 
 
@@ -370,6 +389,8 @@ def main() -> None:
     parser.add_argument("--iterations", type=int)
     parser.add_argument("--eval-steps", type=int)
     parser.add_argument("--actor-horizon", type=int, help="Imagined control steps per actor update")
+    parser.add_argument("--yaw-reward", choices=("clipped", "huber"), default="clipped")
+    parser.add_argument("--world-model-loss", choices=("original", "angular-velocity"), default="angular-velocity")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smoke", action="store_true", help="Run a bounded end-to-end check")
     parser.add_argument("--output", type=Path, help="Write a new checkpoint at this path")
@@ -392,7 +413,10 @@ def main() -> None:
         torch.compiler.set_stance("force_eager")
     if args.device == "cpu":
         torch.set_num_threads(min(4, torch.get_num_threads()))
-    env = CubeManipulation(args.envs, args.device)
+    env = CubeManipulation(
+        args.envs, args.device, angular_velocity_loss=args.world_model_loss == "angular-velocity",
+        yaw_reward=args.yaw_reward,
+    )
     print(f"{args.device}: {args.envs // 2} worlds per skill, {env.dt:.3f} s control step", flush=True)
     if args.evaluate:
         checkpoint = torch.load(args.evaluate, map_location=args.device, weights_only=True)
