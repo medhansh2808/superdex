@@ -47,6 +47,7 @@ class JointReplay:
         self._slots = env.num_envs // 2
         schema = {
             "state": FieldSpec(env.rep.full_state_dim),
+            "next_state": FieldSpec(env.rep.full_state_dim),
             "action": FieldSpec(NUM_ACTIONS),
             "prev_action": FieldSpec(NUM_ACTIONS),
             "task_id": FieldSpec(dtype=torch.long),
@@ -68,6 +69,37 @@ class JointReplay:
         return torch.cat(
             [replay.sample(length, batch_size // 2) for replay in self._blocks]
         )
+
+
+def history_model_batches(recent: JointReplay, history: JointReplay, batch_size: int, count: int):
+    """Mix task-balanced recent and historical trajectories, including terminal targets."""
+    per_task = batch_size // 4
+    length = MODEL_HORIZON
+
+    def draw(replay):
+        window = replay.sample(length, 2 * per_task * count)
+        # JointReplay groups the two tasks contiguously. Balance each minibatch.
+        return window.select("state", "next_state", "action", "terminated").reshape(
+            2, count, per_task, length
+        ).transpose(0, 1).reshape(count, 2 * per_task, length)
+
+    historical = draw(history)
+    try:
+        fresh = draw(recent)
+    except RuntimeError as exc:
+        # Short, failing episodes can exhaust the recent valid H-step windows.
+        if "no valid sequences" not in str(exc):
+            raise
+        fresh = draw(history)
+    samples = torch.cat((fresh, historical), dim=1)
+    terminal_fraction = samples["terminated"][:, :, -1].float().mean()
+    # H actions have H measured successors. The official learner expects H+1
+    # states and ignores the final action. The sampler permits done only at H.
+    states = torch.cat((samples["state"][:, :, :1], samples["next_state"]), dim=2)
+    actions = samples["action"]
+    actions = torch.cat((actions, actions[:, :, -1:]), dim=2)
+    data = TensorDict({"state": states, "action": actions}, batch_size=states.shape[:3], device=states.device)
+    return _with_context(data).unbind(0), terminal_fraction
 
 
 class YawCoverage:
@@ -133,7 +165,7 @@ class Collector:
     @torch.no_grad()
     def collect(
         self, steps: int, replay: JointReplay, actor: MultiEncoderAE | None = None,
-        *, noise_std: float = DEFAULT_NOISE_STD,
+        *, noise_std: float = DEFAULT_NOISE_STD, archive: JointReplay | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if actor is not None:
             actor.eval()
@@ -159,20 +191,22 @@ class Collector:
                     next_state[:, CUBE_YAW_RATE], self.goals["yaw"].squeeze(-1),
                     terminated, truncated,
                 )
-            replay.insert(
-                TensorDict(
-                    {
-                        **{key: self.goals[key] for key in GOAL_KEYS},
-                        "state": self.state,
-                        "action": action,
-                        "prev_action": self.prev_action,
-                        "terminated": terminated,
-                        "truncated": truncated,
-                    },
-                    batch_size=[env.num_envs],
-                    device=env.device,
-                )
+            transition = TensorDict(
+                {
+                    **{key: self.goals[key] for key in GOAL_KEYS},
+                    "state": self.state,
+                    "next_state": next_state,
+                    "action": action,
+                    "prev_action": self.prev_action,
+                    "terminated": terminated,
+                    "truncated": truncated,
+                },
+                batch_size=[env.num_envs],
+                device=env.device,
             )
+            replay.insert(transition)
+            if archive is not None:
+                archive.insert(transition)
 
             self.state, self.prev_action = next_state, action
             ended = (terminated | truncated).nonzero(as_tuple=True)[0]
@@ -352,6 +386,7 @@ def evaluate(env: CubeManipulation, actor: MultiEncoderAE, steps: int, *, captur
             "signed_rad_s_while_held": (yaw[spin].sum() /
                                         (env.dt * survived_steps[spin].sum().clamp_min(1))).item(),
             "drop_rate": (~alive[spin]).float().mean().item(),
+            "mean_held_s": env.dt * survived_steps[spin].float().mean().item(),
             "by_command": {
                 name: {
                     "signed_rotation_deg": torch.rad2deg(yaw[slots].mean()).item(),
@@ -367,6 +402,7 @@ def evaluate(env: CubeManipulation, actor: MultiEncoderAE, steps: int, *, captur
                 env.dt * success_at[successes].float().mean().item() if successes.any() else None
             ),
             "drop_rate": (~alive[tilt]).float().mean().item(),
+            "mean_held_s": env.dt * survived_steps[tilt].float().mean().item(),
         },
     }
 
@@ -415,6 +451,7 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
             "iteration": iteration, "cube_mm": env.cube_mm, "seed": args.seed,
             "actor_horizon": actor_horizon, "policy_noise_std": args.policy_noise_std,
             "world_model_loss": args.world_model_loss, "yaw_reward": args.yaw_reward,
+            "model_replay": args.model_replay,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         with TemporaryDirectory(dir=path.parent) as tmp:
@@ -426,19 +463,28 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
     _log("untrained_policy", evaluate(env, actor, eval_steps))
 
     replay = JointReplay(env, 256 if smoke else 1024)
+    archive = None
+    if args.model_replay == "history":
+        archive = JointReplay(env, min(16384, warmup_steps + iterations * collect_steps))
+    _log("model_replay", {"mode": args.model_replay})
     collector = Collector(env)
-    states, actions = collector.collect(warmup_steps, replay)
+    states, actions = collector.collect(warmup_steps, replay, archive=archive)
     world_learner.update_normalization(states, actions)
     _log("world_model_heldout_before", _world_model_errors(env, dynamics, validation))
 
     if args.report_every:
         collector.coverage = YawCoverage(env)
     for i in range(1, iterations + 1):
-        windows = (
-            _with_context(replay.sample(MODEL_HORIZON + 1, batch_size))
-            for _ in range(world_cfg.num_batches)
-        )
+        if archive is None:
+            windows = (
+                _with_context(replay.sample(MODEL_HORIZON + 1, batch_size))
+                for _ in range(world_cfg.num_batches)
+            )
+        else:
+            windows, terminal_fraction = history_model_batches(replay, archive, batch_size, world_cfg.num_batches)
         model_stats = world_learner.update(windows)
+        if archive is not None:
+            model_stats["Replay/drop_target_fraction"] = terminal_fraction
         starts = replay.sample(1, batch_size)[:, 0]
         if i == 1:
             _log("later_reward_gradient", _verify_bptt(imagined, starts))
@@ -451,13 +497,14 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
         policy_stats = actor_learner.update([starts])
         if env.yaw_reward == "huber":
             policy_stats["Policy/old_flat_yaw_fraction"] = imagined.old_flat_fraction_sum / actor_horizon
-        states, actions = collector.collect(collect_steps, replay, actor, noise_std=args.policy_noise_std)
+        states, actions = collector.collect(collect_steps, replay, actor, noise_std=args.policy_noise_std, archive=archive)
         world_learner.update_normalization(states, actions)
         stats = {k: v.item() for k, v in (model_stats | policy_stats).items()}
         _log(f"iteration {i}/{iterations}", stats)
         if args.report_every and (i % args.report_every == 0 or i == iterations):
             _log("replay_yaw", {"iteration": i, **collector.coverage.report()})
             if i < iterations:
+                _log("world_model_heldout", {"iteration": i, **_world_model_errors(env, dynamics, validation)})
                 devices = [torch.device(env.device)] if torch.device(env.device).type == "cuda" else []
                 with torch.random.fork_rng(devices=devices):
                     _log("intermediate_policy", {"iteration": i, **evaluate(eval_env, actor, eval_steps)})
@@ -492,6 +539,8 @@ def main() -> None:
     parser.add_argument("--video-dir", type=Path, help="Export three MP4s during checkpoint evaluation")
     parser.add_argument("--cube-mm", type=int, choices=(36, 42),
                         help="Training cube edge length (default 36 mm); evaluation uses checkpoint geometry")
+    parser.add_argument("--model-replay", choices=("recent", "history"), default="recent",
+                        help="Use original recent replay or mix recent and historical measured transitions")
     parser.add_argument("--save-reports", action="store_true",
                         help="Save the actor, world model and critic at every intermediate evaluation")
     args = parser.parse_args()

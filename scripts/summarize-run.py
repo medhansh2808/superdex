@@ -11,7 +11,7 @@ def main():
     parser.add_argument("run", type=Path, help="Directory containing train.log")
     args = parser.parse_args()
     print(f"Run {args.run.name}")
-    print(" iter    yaw+°    yaw-°   rad/s  yaw drop   tilt success   tilt error   tilt drop")
+    print(" iter    yaw+°    yaw-°   rad/s  yaw drop   tilt success   tilt error   tilt drop   held s (yaw/tilt)")
     last_iteration = 0
     for line in (args.run / "train.log").read_text().splitlines():
         label, _, payload = line.partition(" ")
@@ -25,10 +25,12 @@ def main():
         i = result.get("iteration", last_iteration if label == "trained_policy" else 0)
         yaw, tilt = result["yaw"], result["reorient"]
         by = yaw["by_command"]
+        held = (f"{yaw['mean_held_s']:.2f}/{tilt['mean_held_s']:.2f}"
+                if "mean_held_s" in yaw and "mean_held_s" in tilt else "—")
         print(f"{i:5d} {by['positive']['signed_rotation_deg']:8.2f} "
               f"{by['negative']['signed_rotation_deg']:8.2f} {yaw['signed_rad_s_while_held']:7.3f} "
               f"{yaw['drop_rate']:9.1%} {tilt['success_rate']:14.1%} "
-              f"{tilt['median_final_held_error_deg']:11.2f}° {tilt['drop_rate']:10.1%}")
+              f"{tilt['median_final_held_error_deg']:11.2f}° {tilt['drop_rate']:10.1%}   {held}")
 
 
 if __name__ == "__main__":
