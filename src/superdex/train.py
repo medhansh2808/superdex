@@ -68,6 +68,51 @@ class JointReplay:
         )
 
 
+class YawCoverage:
+    """Non-overlapping half-second windows from real policy collection."""
+
+    def __init__(self, env: CubeManipulation) -> None:
+        self.dt = env.dt
+        self.window_steps = round(0.5 / env.dt)
+        self.age = torch.zeros_like(env.ids)
+        self.angle = env.origin.new_zeros(env.num_envs)
+        self.windows = []
+        self.cut_short = []
+
+    def update(self, rate, command, dropped, timed_out) -> None:
+        self.age += 1
+        self.angle += rate * self.dt
+        complete = (self.age == self.window_steps) & ~dropped
+        ended = dropped | timed_out
+        # Keep fixed shapes on the GPU until the report, avoiding per-step syncs.
+        self.windows.append(torch.where(complete, torch.rad2deg(self.angle), torch.nan))
+        self.cut_short.append(ended & ~complete)
+        self.commands = command.sign()
+        restart = complete | ended
+        self.age.masked_fill_(restart, 0)
+        self.angle.masked_fill_(restart, 0)
+
+    def report(self) -> dict:
+        angles = torch.stack(self.windows)
+        partials = torch.stack(self.cut_short)
+        result = {"window_s": self.window_steps * self.dt, "threshold_deg": 5.0}
+        # Command magnitudes can change on reset. The sign is fixed per world.
+        for name, sign in (("positive", 1), ("negative", -1)):
+            slots = self.commands == sign
+            aligned = angles[:, slots] * sign
+            held = aligned[aligned.isfinite()]
+            result[name] = {
+                "held_windows": held.numel(),
+                "interrupted_windows": partials[:, slots].sum().item(),
+                "with_command_ge_5deg": (held >= 5).sum().item(),
+                "against_command_ge_5deg": (held <= -5).sum().item(),
+                "mean_signed_deg": held.mean().item() if held.numel() else None,
+            }
+        self.windows.clear()
+        self.cut_short.clear()
+        return result
+
+
 class Collector:
     def __init__(self, env: CubeManipulation) -> None:
         self.env = env
@@ -75,6 +120,7 @@ class Collector:
         self.goals = env.goals(env.ids)
         self.prev_action = self.state.new_zeros((env.num_envs, NUM_ACTIONS))
         self.age = torch.zeros_like(env.ids)
+        self.coverage: YawCoverage | None = None
         self.episode_steps = round(EPISODE_SECONDS / env.dt)
 
     @torch.no_grad()
@@ -100,6 +146,11 @@ class Collector:
             self.age += 1
             terminated = env.drop_error(next_state) > 1
             truncated = self.age >= self.episode_steps
+            if self.coverage is not None:
+                self.coverage.update(
+                    next_state[:, CUBE_YAW_RATE], self.goals["yaw"].squeeze(-1),
+                    terminated, truncated,
+                )
             replay.insert(
                 TensorDict(
                     {
@@ -321,6 +372,13 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
     verify_task_rewards(env)
     print("Yaw, reorientation, and cube-drop reward checks passed.", flush=True)
 
+    eval_env = None
+    if args.report_every and args.report_every < iterations:
+        eval_env = CubeManipulation(
+            env.num_envs, env.device, angular_velocity_loss=args.world_model_loss == "angular-velocity",
+            yaw_reward=env.yaw_reward,
+        )
+
     torch.manual_seed(args.seed + 1)
     held_out = JointReplay(env, warmup_steps)
     Collector(env).collect(warmup_steps, held_out)
@@ -348,6 +406,8 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
     world_learner.update_normalization(states, actions)
     _log("world_model_heldout_before", _world_model_errors(env, dynamics, validation))
 
+    if args.report_every:
+        collector.coverage = YawCoverage(env)
     for i in range(1, iterations + 1):
         windows = (
             _with_context(replay.sample(MODEL_HORIZON + 1, batch_size))
@@ -370,6 +430,12 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
         world_learner.update_normalization(states, actions)
         stats = {k: v.item() for k, v in (model_stats | policy_stats).items()}
         _log(f"iteration {i}/{iterations}", stats)
+        if args.report_every and (i % args.report_every == 0 or i == iterations):
+            _log("replay_yaw", {"iteration": i, **collector.coverage.report()})
+            if i < iterations:
+                devices = [torch.device(env.device)] if torch.device(env.device).type == "cuda" else []
+                with torch.random.fork_rng(devices=devices):
+                    _log("intermediate_policy", {"iteration": i, **evaluate(eval_env, actor, eval_steps)})
 
     _log("world_model_heldout_after", _world_model_errors(env, dynamics, validation))
     _log("trained_policy", evaluate(env, actor, eval_steps))
@@ -388,6 +454,8 @@ def main() -> None:
     parser.add_argument("--envs", type=int)
     parser.add_argument("--iterations", type=int)
     parser.add_argument("--eval-steps", type=int)
+    parser.add_argument("--report-every", type=int, metavar="N",
+                        help="Report real replay yaw coverage and evaluate the policy every N iterations")
     parser.add_argument("--actor-horizon", type=int, help="Imagined control steps per actor update")
     parser.add_argument("--yaw-reward", choices=("clipped", "huber"), default="clipped")
     parser.add_argument("--world-model-loss", choices=("original", "angular-velocity"), default="angular-velocity")
@@ -400,6 +468,8 @@ def main() -> None:
         args.envs = 4 if args.smoke else 64
     if args.envs < 4 or args.envs % 4:
         parser.error("--envs must be a positive multiple of four")
+    if args.report_every is not None and args.report_every < 1:
+        parser.error("--report-every must be positive")
     if args.iterations is not None and args.iterations < 1:
         parser.error("--iterations must be positive")
     if args.actor_horizon is not None and args.actor_horizon < 1:
