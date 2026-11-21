@@ -313,7 +313,7 @@ def _verify_bptt(imagination: ImaginedManipulation, starts: TensorDict) -> dict[
 
 
 @torch.no_grad()
-def evaluate(env: CubeManipulation, actor: MultiEncoderAE, steps: int) -> dict:
+def evaluate(env: CubeManipulation, actor: MultiEncoderAE, steps: int, *, capture=None) -> dict:
     actor.eval()
     state = env.reset()
     goals = env.goals(env.ids, evaluation=True)
@@ -338,6 +338,8 @@ def evaluate(env: CubeManipulation, actor: MultiEncoderAE, steps: int) -> dict:
         holding = alive & (current_error <= REORIENTATION_TOLERANCE)
         hold = torch.where(holding, hold + 1, 0)
         success_at = torch.where((success_at == 0) & (hold >= hold_steps), step, success_at)
+        if capture is not None and step % 2 == 1:
+            capture(env, step, alive, yaw, current_error)
         prev_action = action
 
     spin = goals["task_id"] == 0
@@ -474,7 +476,10 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true", help="Run a bounded end-to-end check")
     parser.add_argument("--output", type=Path, help="Write a new checkpoint at this path")
     parser.add_argument("--evaluate", type=Path, help="Evaluate one checkpoint on both tasks")
+    parser.add_argument("--video-dir", type=Path, help="Export three MP4s during checkpoint evaluation")
     args = parser.parse_args()
+    if args.video_dir and not args.evaluate:
+        parser.error("--video-dir requires --evaluate")
     if not math.isfinite(args.policy_noise_std) or args.policy_noise_std < 0:
         parser.error("--policy-noise-std must be finite and nonnegative")
     if args.envs is None:
@@ -505,7 +510,13 @@ def main() -> None:
         checkpoint = torch.load(args.evaluate, map_location=args.device, weights_only=True)
         actor = _make_actor(env)
         actor.load_state_dict(checkpoint["actor"])
-        _log("checkpoint_policy", evaluate(env, actor, args.eval_steps or 150))
+        capture = None
+        if args.video_dir:
+            from superdex.video import EvaluationClips
+            capture = EvaluationClips(env)
+        _log("checkpoint_policy", evaluate(env, actor, args.eval_steps or 150, capture=capture))
+        if capture is not None:
+            capture.write(args.video_dir)
     else:
         train(args, env)
 
