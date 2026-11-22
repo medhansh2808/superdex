@@ -11,7 +11,7 @@ def main():
     parser.add_argument("run", type=Path, help="Directory containing train.log")
     args = parser.parse_args()
     print(f"Run {args.run.name}")
-    print(" iter    yaw+°    yaw-°   rad/s  yaw drop   tilt success   tilt error   tilt drop   held s (yaw/tilt)")
+    print(" iter    phys+°   phys-°   rad/s  yaw drop   tilt success   tilt error   tilt drop   held s (yaw/tilt)")
     last_iteration = 0
     for line in (args.run / "train.log").read_text().splitlines():
         label, _, payload = line.partition(" ")
@@ -27,8 +27,15 @@ def main():
         by = yaw["by_command"]
         held = (f"{yaw['mean_held_s']:.2f}/{tilt['mean_held_s']:.2f}"
                 if "mean_held_s" in yaw and "mean_held_s" in tilt else "—")
-        print(f"{i:5d} {by['positive']['signed_rotation_deg']:8.2f} "
-              f"{by['negative']['signed_rotation_deg']:8.2f} {yaw['signed_rad_s_while_held']:7.3f} "
+        if "physical_yaw_deg" in by["positive"]:
+            for name in ("positive", "negative"):
+                cmd = by[name]
+                print(f"  turn {i:3d} {name:8s} physical {cmd['physical_yaw_deg']:+7.2f}°"
+                      f"  first face {cmd['first_face_rate']:.1%}  complete {cmd['full_turn_success']:.1%}")
+        positive = by["positive"]["signed_rotation_deg"]
+        negative = -by["negative"]["signed_rotation_deg"]
+        print(f"{i:5d} {positive:8.2f} "
+              f"{negative:8.2f} {yaw['signed_rad_s_while_held']:7.3f} "
               f"{yaw['drop_rate']:9.1%} {tilt['success_rate']:14.1%} "
               f"{tilt['median_final_held_error_deg']:11.2f}° {tilt['drop_rate']:10.1%}   {held}")
 

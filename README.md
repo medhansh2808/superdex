@@ -65,3 +65,21 @@ The learner imports the pinned official SuperMimic dynamics, world-model update,
 The unchanged right-hand MJCF and its ten referenced meshes are from [MuJoCo Menagerie at `370c439`](https://github.com/google-deepmind/mujoco_menagerie/tree/370c43965323c0944b433b202aac5058b5f907a9/leap_hand). The bundled [MIT license](src/superdex/assets/leap_hand/LICENSE) credits Ananye Agarwal.
 
 The baseline setup uses upstream [SuperMimic](https://github.com/HybridRobotics/supermimic/tree/698ea39bc901d8fe733b3c8621df3199d241f7e4) and [mjlab_research](https://github.com/HybridRobotics/mjlab_research/tree/6ea3e574b08605b79a290a6d464a812a26acd6fd), both under Apache-2.0.
+
+### Full-turn yaw task
+
+Run `bash scripts/train-four-finger-500.sh history turn` in the 4090 checkout. The
+32-world joint run assigns eight worlds to each yaw direction and sixteen to tilt.
+Each eight-second episode starts from the calibrated 42 mm, 50 g four-finger
+grasp with zero joint and object velocity. A fixed front camera faces the
+horizontal projection of the cube's local +Y normal at reset. The four
+side faces carry one to four dots in the videos.
+
+Positive yaw is counterclockwise viewed from above. Evaluation checks the pose
+at +90°, +180°, +270°, +360° for the positive command (faces 2, 3, 4, 1)
+and the corresponding negative angles for the negative command (4, 3, 2, 1).
+Each waypoint uses a 10° yaw and orientation tolerance. Success requires
+surviving to the end with the last 0.25 s inside the finish tolerance and
+angular speed at most 0.2 rad/s. The first-face rate reports partial progress.
+The actor receives the signed turns remaining. Physical yaw is measured from
+successive orientations by unwrapping the heading of the first face.

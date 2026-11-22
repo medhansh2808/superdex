@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 from superdex.manipulation import (
-    CUBE_ORIENTATION, CUBE_POSITION, CUBE_YAW_RATE, NUM_ACTIONS,
+    advance_goal, heading_step, CUBE_ORIENTATION, CUBE_POSITION, CUBE_YAW_RATE, NUM_ACTIONS,
     CubeManipulation, observations, orientation_error,
 )
 from superdex.train import ImaginedManipulation, _make_actor, _make_dynamics
@@ -18,7 +18,7 @@ HORIZONS = (1, 4, 8, 32)
 @torch.no_grad()
 def diagnose(checkpoint: Path, num_envs: int, device: str) -> None:
     weights = torch.load(checkpoint, weights_only=True, map_location=device)
-    env = CubeManipulation(num_envs, device, cube_mm=weights.get("cube_mm", 36))
+    env = CubeManipulation(num_envs, device, cube_mm=weights.get("cube_mm", 36), yaw_reward=weights.get("yaw_reward", "clipped"))
     actor = _make_actor(env).eval()
     actor.load_state_dict(weights["actor"])
     dynamics = _make_dynamics(env).eval()
@@ -44,7 +44,10 @@ def diagnose(checkpoint: Path, num_envs: int, device: str) -> None:
         for step in range(1, max(HORIZONS) + 1):
             obs = observations(env.rep.represent(state), previous, goals)
             action = env.bound_action(actor(obs))
+            prior = state
             state = env.step(action)
+            if env.yaw_reward == "turn":
+                goals = advance_goal(goals, heading_step(prior, state))
             imagined.step(action)
             predicted = imagined.state
             previous = action

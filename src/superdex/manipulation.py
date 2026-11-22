@@ -37,6 +37,36 @@ def signed_yaw_rate(state: torch.Tensor, command: torch.Tensor) -> torch.Tensor:
     return state[..., CUBE_YAW_RATE] * command.sign() / command.abs().clamp_min(0.75)
 
 
+def front_normal(quat: torch.Tensor) -> torch.Tensor:
+    """World normal of side 1 (local +Y), for scalar-first unit quaternions."""
+    w, x, y, z = quat.unbind(-1)
+    return torch.stack((2*(x*y-w*z), 1-2*(x*x+z*z), 2*(y*z+w*x)), dim=-1)
+
+
+def heading_step(state, next_state):
+    a = front_normal(state[..., CUBE_ORIENTATION])
+    b = front_normal(next_state[..., CUBE_ORIENTATION])
+    cross = a[..., 0]*b[..., 1] - a[..., 1]*b[..., 0]
+    dot = (a[..., :2]*b[..., :2]).sum(-1)
+    valid = cross.square() + dot.square() > 1e-6
+    return torch.atan2(torch.where(valid, cross, 0.), torch.where(valid, dot, 1.))
+
+
+def advance_goal(goals, delta):
+    following = goals.clone(False)
+    following["yaw"] = goals["yaw"] - torch.where(
+        goals["task_id"] == 0, delta / math.tau, 0.
+    ).unsqueeze(-1)
+    return following
+
+
+def yawed_pose(origin, angle):
+    half = angle / 2
+    zero = torch.zeros_like(half)
+    rotation = torch.stack((half.cos(), zero, zero, half.sin()), dim=-1)
+    return quat_mul(rotation, origin.expand_as(rotation))
+
+
 class HandCubeRepresentation(GenCoordRepresentation):
     """Treat the cube as the free body in SuperMimic's integrated representation."""
 
@@ -171,7 +201,7 @@ class CubeManipulation:
         neutral = self.origin[CUBE_ORIENTATION].expand_as(tilt)
         attitude = torch.where(task_id[:, None] == 1, quat_mul(tilt, neutral), neutral)
         # Reorientation slots use a zero-yaw command for the official latent anchor.
-        yaw = torch.where(task_id == 0, direction * speed, 0.0)
+        yaw = torch.where(task_id == 0, direction if self.yaw_reward == "turn" else direction * speed, 0.0)
         return TensorDict(
             {"task_id": task_id, "yaw": yaw[:, None], "reorient": attitude},
             batch_size=[ids.numel()],
@@ -196,7 +226,20 @@ class CubeManipulation:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         command = goals["yaw"].squeeze(-1)
         signed_rate = signed_yaw_rate(next_state, command)
-        if self.yaw_reward == "huber":
+        if self.yaw_reward == "turn":
+            remaining = command * math.tau
+            delta = heading_step(state, next_state)
+            after = remaining - delta
+            progress = (remaining.abs() - after.abs()) / self.dt
+            speed_error = next_state[..., CUBE_YAW_RATE] - remaining.clamp(-1, 1)
+            # Modulo one revolution, the desired path pose is independent of direction.
+            path_error = orientation_error(next_state[..., CUBE_ORIENTATION],
+                                           yawed_pose(self.origin[CUBE_ORIENTATION], -after))
+            settled = torch.exp(-after.abs() / math.radians(10)) * torch.exp(-speed_error.abs())
+            spin = (0.65 * progress.tanh() + 0.35 * settled
+                    - 0.15 * torch.nn.functional.smooth_l1_loss(speed_error, torch.zeros_like(speed_error), reduction="none")
+                    - 0.25 * path_error)
+        elif self.yaw_reward == "huber":
             # Match the clipped reward at rest (-0.1) and at the target (1).
             error = torch.nn.functional.huber_loss(
                 signed_rate, torch.ones_like(signed_rate), reduction="none"
