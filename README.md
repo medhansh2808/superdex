@@ -83,3 +83,22 @@ surviving to the end with the last 0.25 s inside the finish tolerance and
 angular speed at most 0.2 rad/s. The first-face rate reports partial progress.
 The actor receives the signed turns remaining. Physical yaw is measured from
 successive orientations by unwrapping the heading of the first face.
+
+### Quarter turns with a stable hold
+
+Run `bash scripts/train-four-finger-500.sh history quarter` on the 4090.
+The two commands use face 1 → face 2 (+90°) and face 1 → face 4 (−90°)
+from the calibrated 42 mm grasp.
+
+After each reset, the calibrated finger targets hold the cube for one simulated
+second before policy control. At each control step, face 1 must face the camera
+with four fingertip contacts, at most 2 mm of drift and 3° of pose error, and
+speeds below 1 cm/s and 0.15 rad/s. Training stops if a reset fails this check.
+
+The policy has four seconds to turn and settle. Success requires the commanded
+face to be foremost and the turn and final cube pose to be within 15° of target.
+The cube must stay in that position and within the speed limits, supported by
+at least two fingertips, for the final uninterrupted second with at most 2 mm
+of drift. The summary reports
+stable starts, face arrival, hold duration, drops and success for each direction.
+Checkpoint replay includes the initial hold and exports one clip per command.

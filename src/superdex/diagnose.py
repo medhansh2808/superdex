@@ -8,7 +8,7 @@ import torch
 
 from superdex.manipulation import (
     advance_goal, heading_step, CUBE_ORIENTATION, CUBE_POSITION, CUBE_YAW_RATE, NUM_ACTIONS,
-    CubeManipulation, observations, orientation_error,
+    CubeManipulation, orientation_error,
 )
 from superdex.train import ImaginedManipulation, _make_actor, _make_dynamics
 
@@ -31,6 +31,11 @@ def diagnose(checkpoint: Path, num_envs: int, device: str) -> None:
     direction = goals["yaw"].squeeze(-1).sign()
     groups = {"positive_yaw": direction > 0, "negative_yaw": direction < 0,
               "reorient": goals["task_id"] == 1}
+    if env.quarter:
+        del groups["reorient"]
+        for _ in range(env.hold_steps):
+            state = env.step(previous)
+            alive &= env.start_stable(state)
     samples = {h: [] for h in HORIZONS}
     for _ in range(4):
         # Restart imagination from a measured state every 32 control steps.
@@ -42,7 +47,7 @@ def diagnose(checkpoint: Path, num_envs: int, device: str) -> None:
         real_yaw = torch.zeros_like(direction)
         predicted_yaw = torch.zeros_like(direction)
         for step in range(1, max(HORIZONS) + 1):
-            obs = observations(env.rep.represent(state), previous, goals)
+            obs = env.observe(env.rep.represent(state), previous, goals)
             action = env.bound_action(actor(obs))
             prior = state
             state = env.step(action)

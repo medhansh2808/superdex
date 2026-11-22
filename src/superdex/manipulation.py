@@ -7,7 +7,7 @@ import math
 import mujoco
 import torch
 from mjlab.sim import Simulation
-from mjlab.utils.lab_api.math import quat_apply, quat_conjugate, quat_mul
+from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse, quat_conjugate, quat_mul
 from supermimic.representations import GenCoordRepresentation
 from supermimic.tasks.task_spec import build_actor_obs_td
 from tensordict import TensorDict
@@ -18,6 +18,9 @@ from superdex.mjlab_scene import leap_simulation_cfg
 
 NUM_ACTIONS = len(LEAP_JOINTS)
 TASKS = ("yaw", "reorient")
+QUARTER_TASKS = ("positive", "negative")
+HOLD_SECONDS = 1.0
+QUARTER_CONTROL_SECONDS = 4.0
 DECIMATION = 10
 ACTION_SCALE = 0.35
 CUBE_POSITION = slice(0, 3)
@@ -112,6 +115,10 @@ class CubeManipulation:
         self, num_envs: int, device: str, *, angular_velocity_loss: bool = True,
         yaw_reward: str = "clipped", cube_mm: int = 36,
     ) -> None:
+        self.quarter = yaw_reward == "quarter"
+        if self.quarter and cube_mm != 42:
+            raise ValueError("The quarter-turn task requires the calibrated 42 mm grasp")
+        self.task_names = QUARTER_TASKS if self.quarter else TASKS
         self.cube_mm = cube_mm
         self.yaw_reward = yaw_reward
         self.num_envs = num_envs
@@ -123,6 +130,22 @@ class CubeManipulation:
             num_envs=num_envs, cfg=leap_simulation_cfg(), model=model, device=device
         )
         self.dt = model.opt.timestep * DECIMATION
+        self.hold_steps = math.ceil(HOLD_SECONDS / self.dt)
+        if self.quarter:
+            import warp as wp
+
+            data = self.sim.wp_data
+            self._contact_geom = wp.to_torch(data.contact.geom)
+            self._contact_world = wp.to_torch(data.contact.worldid)
+            self._contact_distance = wp.to_torch(data.contact.dist)
+            self._contact_count = wp.to_torch(data.nacon).reshape(-1)[0]
+            self._contact_slots = torch.arange(len(self._contact_world), device=device)
+            self._cube_geom = model.geom("cube/surface").id
+            self._tip_geoms = torch.tensor(
+                [model.geom(name).id for name in ("if_tip", "mf_tip", "rf_tip", "th_tip")],
+                device=device,
+            )
+
         self._qpos = self.sim.data.qpos[:]
         self._qvel = self.sim.data.qvel[:]
         self._ctrl = self.sim.data.ctrl[:]
@@ -144,6 +167,8 @@ class CubeManipulation:
             (ranges - self.action_offset[:, None]) / ACTION_SCALE
         ).clamp(-1, 1).unbind(-1)
         self.origin = self._reset_pos[self._cube_pose]
+        self.front_view = front_normal(self.origin[CUBE_ORIENTATION]).clone()
+        self.front_view[2] = 0
         self.rep = HandCubeRepresentation(
             self.action_offset, self.dt, angular_velocity_loss=angular_velocity_loss
         )
@@ -169,6 +194,45 @@ class CubeManipulation:
         self.sim.forward()
         return self.state()
 
+    def visible_face(self, state):
+        view = self.front_view.expand(state.shape[0], -1)
+        x, y, z = quat_apply_inverse(state[:, CUBE_ORIENTATION], view).unbind(-1)
+        # Face numbers match the dot markers rendered from the fixed front camera.
+        return torch.stack((y, x, -y, -x, z.abs()), dim=-1).argmax(dim=-1) + 1
+
+    def fingertip_contacts(self):
+        """Count distinct fingertips touching the cube in each Warp world."""
+        first, second = self._contact_geom.unbind(-1)
+        valid = (self._contact_slots < self._contact_count) & (self._contact_distance <= 0)
+        touched = ((first == self._cube_geom)[:, None] & (second[:, None] == self._tip_geoms)
+                   | (second == self._cube_geom)[:, None] & (first[:, None] == self._tip_geoms))
+        counts = self.ids.new_zeros((self.num_envs, len(self._tip_geoms)))
+        worlds = self._contact_world.long().clamp(0, self.num_envs - 1)
+        counts.index_add_(0, worlds, (touched & valid[:, None]).long())
+        return (counts > 0).sum(dim=1)
+
+    def cube_still(self, state):
+        linear = state[:, 7 + NUM_ACTIONS:CUBE_ANGULAR_VELOCITY.start]
+        angular = state[:, CUBE_ANGULAR_VELOCITY]
+        return (linear.norm(dim=-1) <= .01) & (angular.norm(dim=-1) <= .15)
+
+    def start_stable(self, state):
+        drift = (state[:, CUBE_POSITION] - self.origin[CUBE_POSITION]).norm(dim=-1)
+        pose = state[:, CUBE_ORIENTATION]
+        pose_error = orientation_error(pose, self.origin[CUBE_ORIENTATION].expand_as(pose))
+        return ((self.visible_face(state) == 1) & (self.fingertip_contacts() == 4)
+                & self.cube_still(state) & (drift <= .002) & (pose_error <= math.radians(3)))
+
+    def observe(self, rep_state, prev_action, goals):
+        if not self.quarter:
+            return observations(rep_state, prev_action, goals)
+        sensor = torch.cat((rep_state, prev_action), dim=-1)
+        yaw = goals["yaw"]
+        return build_actor_obs_td(
+            dict.fromkeys(self.task_names, yaw), sensor.unsqueeze(1),
+            torch.cat((sensor, yaw), dim=-1),
+        )
+
     def bound_action(self, action: torch.Tensor) -> torch.Tensor:
         return torch.clamp(action, self._min_action, self._max_action)
 
@@ -183,6 +247,11 @@ class CubeManipulation:
         self, ids: torch.Tensor, *, evaluation: bool = False
     ) -> TensorDict:
         task_id = self.task_id[ids]
+        if self.quarter:
+            yaw = torch.where(task_id == 0, .25, -.25)
+            attitude = yawed_pose(self.origin[CUBE_ORIENTATION], yaw * math.tau)
+            return TensorDict({"task_id": task_id, "yaw": yaw[:, None], "reorient": attitude},
+                              batch_size=[ids.numel()], device=self.device)
         direction = torch.where(ids % 2 == 0, 1.0, -1.0)
         if evaluation:
             speed = torch.full_like(direction, 1.0)
@@ -226,7 +295,17 @@ class CubeManipulation:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         command = goals["yaw"].squeeze(-1)
         signed_rate = signed_yaw_rate(next_state, command)
-        if self.yaw_reward == "turn":
+        if self.quarter:
+            target = goals["reorient"]
+            old_error = orientation_error(state[..., CUBE_ORIENTATION], target)
+            new_error = orientation_error(next_state[..., CUBE_ORIENTATION], target)
+            progress = ((old_error - new_error) / self.dt).tanh()
+            speed = next_state[..., CUBE_ANGULAR_VELOCITY].norm(dim=-1)
+            settled = torch.exp(-new_error / math.radians(20) - speed)
+            # Rotation and settling both matter. Penalize moving out of the grasp.
+            drift = self.drop_error(next_state)
+            spin = .6 * progress + .5 * settled - .4 * drift.square().clamp(max=1)
+        elif self.yaw_reward == "turn":
             remaining = command * math.tau
             delta = heading_step(state, next_state)
             after = remaining - delta
@@ -251,7 +330,7 @@ class CubeManipulation:
         new_error = orientation_error(next_state[..., CUBE_ORIENTATION], goals["reorient"])
         progress = ((old_error - new_error) / (2 * self.dt)).clamp(-1, 1)
         reorient = progress + 0.1 * torch.exp(-new_error / math.radians(15))
-        skill = torch.where(goals["task_id"] == 0, spin, reorient)
+        skill = spin if self.quarter else torch.where(goals["task_id"] == 0, spin, reorient)
 
         error = self.drop_error(next_state)
         done = torch.sigmoid((error - 1) / 0.08) if imagined else (error > 1).float()
@@ -276,10 +355,18 @@ def verify_task_rewards(env: CubeManipulation) -> None:
     actions = state.new_zeros((env.num_envs, NUM_ACTIONS))
     yaw_only = state.clone()
     yaw_only[:, CUBE_YAW_RATE] = goals["yaw"].squeeze(-1)
+    if env.quarter:
+        yaw_only[:, CUBE_ORIENTATION] = yawed_pose(
+            env.origin[CUBE_ORIENTATION], goals["yaw"].squeeze(-1).sign() * .02
+        )
     good, _ = env.score(state, yaw_only, actions, actions, goals, imagined=False)
     yaw_only[:, CUBE_YAW_RATE].neg_()
+    if env.quarter:
+        yaw_only[:, CUBE_ORIENTATION] = yawed_pose(
+            env.origin[CUBE_ORIENTATION], -goals["yaw"].squeeze(-1).sign() * .02
+        )
     bad, _ = env.score(state, yaw_only, actions, actions, goals, imagined=False)
-    spin = goals["task_id"] == 0
+    spin = (goals["task_id"] == 0) | env.quarter
     if not torch.all(good[spin] > bad[spin]):
         raise RuntimeError("Yaw reward must prefer the commanded direction")
 
@@ -287,7 +374,7 @@ def verify_task_rewards(env: CubeManipulation) -> None:
     on_target[:, CUBE_ORIENTATION] = goals["reorient"]
     arrived, _ = env.score(state, on_target, actions, actions, goals, imagined=False)
     idle, _ = env.score(state, state, actions, actions, goals, imagined=False)
-    if not torch.all(arrived[~spin] > idle[~spin]):
+    if not env.quarter and not torch.all(arrived[~spin] > idle[~spin]):
         raise RuntimeError("Reorientation reward must prefer progress to the 3D target")
     torch.testing.assert_close(
         orientation_error(-on_target[:, CUBE_ORIENTATION], goals["reorient"]),

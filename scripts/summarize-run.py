@@ -11,7 +11,7 @@ def main():
     parser.add_argument("run", type=Path, help="Directory containing train.log")
     args = parser.parse_args()
     print(f"Run {args.run.name}")
-    print(" iter    phys+°   phys-°   rad/s  yaw drop   tilt success   tilt error   tilt drop   held s (yaw/tilt)")
+    printed_header = False
     last_iteration = 0
     for line in (args.run / "train.log").read_text().splitlines():
         label, _, payload = line.partition(" ")
@@ -23,6 +23,19 @@ def main():
             continue
         result = json.loads(payload)
         i = result.get("iteration", last_iteration if label == "trained_policy" else 0)
+        if "quarter_turn" in result:
+            if not printed_header:
+                print(" iter  command   physical    start   reached   longest hold    success    drops")
+                printed_header = True
+            for name, task in result["quarter_turn"].items():
+                print(f"{i:5d}  {name:8s} {task['physical_yaw_deg']:+8.2f}°"
+                      f" {task['start_stable_rate']:8.1%} {task['target_face_rate']:9.1%}"
+                      f" {task['mean_longest_target_hold_s']:12.2f} s"
+                      f" {task['success_rate']:10.1%} {task['drop_rate']:8.1%}")
+            continue
+        if not printed_header:
+            print(" iter    phys+°   phys-°   rad/s  yaw drop   tilt success   tilt error   tilt drop   held s (yaw/tilt)")
+            printed_header = True
         yaw, tilt = result["yaw"], result["reorient"]
         by = yaw["by_command"]
         held = (f"{yaw['mean_held_s']:.2f}/{tilt['mean_held_s']:.2f}"

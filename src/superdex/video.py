@@ -18,8 +18,10 @@ from superdex.manipulation import front_normal
 
 class EvaluationClips:
     def __init__(self, env):
-        self.slots = [0, 1, env.num_envs // 2]
-        self.turn = env.yaw_reward == "turn"
+        self.quarter = env.quarter
+        self.hold_steps = env.hold_steps
+        self.slots = [0, env.num_envs // 2] if self.quarter else [0, 1, env.num_envs // 2]
+        self.turn = env.yaw_reward == "turn" or self.quarter
         self.front = front_normal(env.origin[3:7]).cpu().numpy()
         self.cube_mm = env.cube_mm
         self.dt = env.dt
@@ -29,8 +31,10 @@ class EvaluationClips:
     def __call__(self, env, step, alive, yaw, error):
         slots = self.slots
         qpos = env.sim.data.qpos[:][slots].cpu().numpy()
-        # Yaw in evaluate() already includes the command sign.
-        degrees = torch.rad2deg(torch.stack([yaw[slots[0]], yaw[slots[1]], error[slots[2]]]))
+        values = yaw[slots]
+        if not self.quarter:
+            values[2] = error[slots[2]]
+        degrees = torch.rad2deg(values)
         self.frames.append((step, qpos, alive[slots].tolist(), degrees.tolist()))
 
     def write(self, directory: Path):
@@ -65,6 +69,9 @@ class EvaluationClips:
         labels = ("Yaw +1 rad/s", "Yaw -1 rad/s", "Reorientation")
         if self.turn:
             labels = ("Turn +360 deg", "Turn -360 deg", "Reorientation")
+        if self.quarter:
+            names = names[:2]
+            labels = ("+90 deg | face 1 to 2", "-90 deg | face 1 to 4")
         with mujoco.Renderer(model, height=height, width=width) as renderer, TemporaryDirectory(dir=directory) as tmp:
             for i, name in enumerate(names):
                 path = Path(tmp) / f"{name}.mp4"
@@ -91,6 +98,8 @@ class EvaluationClips:
                                 face = str(facing) if abs(local_view[2]) <= max(normals @ local_view) else "cap"
                                 metric = f"front {face}   physical yaw"
                             status = "held" if alive[i] else "dropped"
+                            if self.quarter and step <= self.hold_steps:
+                                status = "initial hold" if alive[i] else "unstable start"
                             caption = f"{labels[i]}   {step * self.dt:.2f} s   {status}   {metric} {degrees[i]:+.1f} deg"
                             draw.rectangle((0, 0, width, 28), fill=(24, 28, 34))
                             draw.text((10, 4), caption, fill="white", font_size=16)

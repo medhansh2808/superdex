@@ -22,13 +22,13 @@ from tensordict import TensorDict
 from superdex.manipulation import (
     ACTION_SCALE,
     advance_goal, heading_step, yawed_pose, CUBE_ANGULAR_VELOCITY,
+    QUARTER_CONTROL_SECONDS,
     CUBE_ORIENTATION,
     CUBE_POSITION,
     CUBE_YAW_RATE,
     NUM_ACTIONS,
     TASKS,
     CubeManipulation,
-    observations,
     orientation_error,
     signed_yaw_rate,
     verify_task_rewards,
@@ -161,7 +161,12 @@ class Collector:
         self.prev_action = self.state.new_zeros((env.num_envs, NUM_ACTIONS))
         self.age = torch.zeros_like(env.ids)
         self.coverage: YawCoverage | None = None
-        self.episode_steps = round((8 if env.yaw_reward == "turn" else EPISODE_SECONDS) / env.dt)
+        control_seconds = QUARTER_CONTROL_SECONDS if env.quarter else (
+            8 if env.yaw_reward == "turn" else EPISODE_SECONDS
+        )
+        self.episode_steps = round(control_seconds / env.dt)
+        if env.quarter:
+            self.initial_hold = torch.zeros_like(self.age)
 
     @torch.no_grad()
     def collect(
@@ -178,19 +183,33 @@ class Collector:
             if actor is None:
                 action = 0.75 * self.prev_action + noise
             else:
-                obs = observations(env.rep.represent(self.state), self.prev_action, self.goals)
+                obs = env.observe(env.rep.represent(self.state), self.prev_action, self.goals)
                 action = actor(obs) + noise
             action = env.bound_action(action)
+            if env.quarter:
+                ready = self.initial_hold >= env.hold_steps
+                action = torch.where(ready[:, None], action, 0.)
             states.append(self.state)
             actions.append(action.clone())
             next_state = env.step(action)
-            self.age += 1
+            if env.quarter:
+                unstable_start = ~ready & ~env.start_stable(next_state)
+                if unstable_start.any():
+                    count = unstable_start.sum().item()
+                    raise RuntimeError(f"Face 1 failed to hold stably during reset in {count} worlds")
+                self.initial_hold += ~ready
+                self.age += ready
+            else:
+                self.age += 1
             terminated = env.drop_error(next_state) > 1
             truncated = self.age >= self.episode_steps
             if self.coverage is not None:
+                direction = (1. - 2. * env.task_id) if env.quarter else (
+                    torch.where(env.ids % 2 == 0, 1., -1.) * (env.task_id == 0)
+                )
                 self.coverage.update(
                     next_state[:, CUBE_YAW_RATE],
-                    torch.where(env.ids % 2 == 0, 1., -1.) * (env.task_id == 0),
+                    direction,
                     terminated, truncated,
                 )
             transition = TensorDict(
@@ -219,6 +238,8 @@ class Collector:
                 self.goals[ended] = env.goals(ended)
                 self.age[ended] = 0
                 self.prev_action[ended] = 0
+                if env.quarter:
+                    self.initial_hold[ended] = 0
         return torch.stack(states), torch.stack(actions)
 
 
@@ -240,7 +261,7 @@ class ImaginedManipulation:
         self.prev_action = start["prev_action"]
         self.goals = start.select(*GOAL_KEYS)
         self.context = self.state.new_empty((len(start), 0))
-        return observations(self.rep_state, self.prev_action, self.goals)
+        return self.env.observe(self.rep_state, self.prev_action, self.goals)
 
     def step(self, action: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor]:
         action = self.env.bound_action(action)
@@ -259,22 +280,22 @@ class ImaginedManipulation:
         if self.env.yaw_reward == "turn":
             self.goals = advance_goal(self.goals, heading_step(self.state, next_state))
         self.state, self.prev_action = next_state, action
-        return observations(self.rep_state, action, self.goals), reward, done
+        return self.env.observe(self.rep_state, action, self.goals), reward, done
 
 
 def _make_actor(env: CubeManipulation) -> MultiEncoderAE:
     def use_live_goals(*_):
         raise RuntimeError("LEAP goals come from the manipulation environment")
 
-    specs = [TaskSpec(name, dim, use_live_goals) for name, dim in zip(TASKS, (1, 4), strict=True)]
+    specs = [TaskSpec(name, dim, use_live_goals) for name, dim in zip(env.task_names, (1, 1) if env.quarter else (1, 4), strict=True)]
     actor = MultiEncoderAE(
         obs_dim=env.rep.rep_state_dim + NUM_ACTIONS,
         action_dim=NUM_ACTIONS,
         task_specs=specs,
-        slot_mix=dict.fromkeys(TASKS, 0.5),
+        slot_mix=dict.fromkeys(env.task_names, 0.5),
         latent_dim=32,
         hidden_dims=(2048, 1024, 512, 256),
-        latent_bc_weight=0.1,
+        latent_bc_weight=0.0 if env.quarter else 0.1,
         history_length=1,
     ).to(env.device)
     # Small initial offsets keep the hand close to its calibrated grasp.
@@ -319,7 +340,7 @@ def _world_model_errors(env: CubeManipulation, dynamics: Dynamics, window: Tenso
             actual = states[:, horizon]
             displacement = predicted[:, CUBE_POSITION] - actual[:, CUBE_POSITION]
             angle = orientation_error(predicted[:, CUBE_ORIENTATION], actual[:, CUBE_ORIENTATION])
-            for task_id, name in enumerate(TASKS):
+            for task_id, name in enumerate(env.task_names):
                 slots = window["task_id"][:, 0] == task_id
                 errors[f"{name}/{horizon}"] = {
                     "position_mm": (1000 * displacement[slots].norm(dim=-1).mean()).item(),
@@ -345,7 +366,7 @@ def _verify_bptt(imagination: ImaginedManipulation, starts: TensorDict) -> dict[
     finally:
         imagination.dynamics.requires_grad_(True)
     result = {}
-    for task_id, name in enumerate(TASKS):
+    for task_id, name in enumerate(imagination.env.task_names):
         norm = gradient[starts["task_id"] == task_id].norm().item()
         if not math.isfinite(norm) or norm == 0:
             raise RuntimeError(f"Later rewards supplied no finite BPTT gradient for {name}")
@@ -354,7 +375,68 @@ def _verify_bptt(imagination: ImaginedManipulation, starts: TensorDict) -> dict[
 
 
 @torch.no_grad()
+def evaluate_quarters(env, actor, steps, capture):
+    actor.eval()
+    state = env.reset()
+    goals = env.goals(env.ids, evaluation=True)
+    direction = goals["yaw"].squeeze(-1).sign()
+    target_face = torch.where(direction > 0, 2, 4)
+    previous = state.new_zeros((env.num_envs, NUM_ACTIONS))
+    yaw = torch.zeros_like(direction)
+    valid_start = torch.ones_like(env.ids, dtype=torch.bool)
+    for step in range(1, env.hold_steps + 1):
+        state = env.step(previous)
+        valid_start &= env.start_stable(state)
+        if capture is not None and step % 2 == 1:
+            capture(env, step, valid_start, yaw, yaw)
+
+    alive = valid_start.clone()
+    reached = torch.zeros_like(alive)
+    stable_steps = torch.zeros_like(env.ids)
+    longest = torch.zeros_like(stable_steps)
+    hold_position = state[:, CUBE_POSITION]
+    for step in range(1, steps + 1):
+        obs = env.observe(env.rep.represent(state), previous, goals)
+        action = env.bound_action(actor(obs))
+        action = torch.where(alive[:, None], action, 0.)
+        next_state = env.step(action)
+        alive &= env.drop_error(next_state) <= 1
+        yaw += torch.where(alive, heading_step(state, next_state), 0.)
+        at_face = (env.visible_face(next_state) == target_face) & alive
+        reached |= at_face
+        error = orientation_error(next_state[:, CUBE_ORIENTATION], goals["reorient"])
+        tolerance = math.radians(15)
+        directed_turn = (yaw - direction * math.pi / 2).abs() <= tolerance
+        settled = (at_face & directed_turn & (error <= tolerance)
+                   & env.cube_still(next_state) & (env.fingertip_contacts() >= 2))
+        position = next_state[:, CUBE_POSITION]
+        drift = (position - hold_position).norm(dim=-1)
+        restart = (stable_steps == 0) | (drift > .002)
+        hold_position = torch.where(restart[:, None], position, hold_position)
+        stable_steps = torch.where(settled, torch.where(restart, 1, stable_steps + 1), 0)
+        longest = torch.maximum(longest, stable_steps)
+        if capture is not None and (step + env.hold_steps) % 2 == 1:
+            capture(env, step + env.hold_steps, alive, yaw, error)
+        state, previous = next_state, action
+
+    quarter_turn = {}
+    for task_id, name in enumerate(env.task_names):
+        slots = env.task_id == task_id
+        quarter_turn[name] = {
+            "start_stable_rate": valid_start[slots].float().mean().item(),
+            "target_face_rate": reached[slots].float().mean().item(),
+            "success_rate": ((stable_steps >= env.hold_steps) & alive)[slots].float().mean().item(),
+            "mean_longest_target_hold_s": env.dt * longest[slots].float().mean().item(),
+            "drop_rate": (valid_start & ~alive)[slots].float().mean().item(),
+            "physical_yaw_deg": torch.rad2deg(yaw[slots]).mean().item(),
+        }
+    return {"quarter_turn": quarter_turn}
+
+
+@torch.no_grad()
 def evaluate(env: CubeManipulation, actor: MultiEncoderAE, steps: int, *, capture=None) -> dict:
+    if env.quarter:
+        return evaluate_quarters(env, actor, steps, capture)
     actor.eval()
     state = env.reset()
     goals = env.goals(env.ids, evaluation=True)
@@ -372,7 +454,7 @@ def evaluate(env: CubeManipulation, actor: MultiEncoderAE, steps: int, *, captur
     ordered = torch.ones_like(alive)
     settled_steps = torch.zeros_like(stage)
     for step in range(1, steps + 1):
-        obs = observations(env.rep.represent(state), prev_action, goals)
+        obs = env.observe(env.rep.represent(state), prev_action, goals)
         action = env.bound_action(actor(obs))
         prior = state
         state = env.step(torch.where(alive[:, None], action, 0.0))
@@ -441,13 +523,16 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
     smoke = args.smoke
     batch_size = 16 if smoke else 256
     collect_steps = 8 if smoke else 32
-    warmup_steps = 24 if smoke else 64
-    eval_steps = args.eval_steps or (20 if smoke else (400 if env.yaw_reward == "turn" else 150))
+    warmup_steps = (24 if smoke else 64) + (env.hold_steps if env.quarter else 0)
+    default_eval = round(QUARTER_CONTROL_SECONDS / env.dt) if env.quarter else (
+        400 if env.yaw_reward == "turn" else 150
+    )
+    eval_steps = args.eval_steps or (20 if smoke else default_eval)
     iterations = args.iterations or (2 if smoke else 100)
     _log("objectives", {"yaw_reward": args.yaw_reward, "world_model_loss": args.world_model_loss})
     _log("collection", {"policy_noise_std": args.policy_noise_std, "warmup_noise_std": DEFAULT_NOISE_STD})
     verify_task_rewards(env)
-    print("Yaw, reorientation, and cube-drop reward checks passed.", flush=True)
+    print("Task reward and cube-drop checks passed.", flush=True)
 
     eval_env = None
     if args.report_every and args.report_every < iterations:
@@ -464,7 +549,7 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
 
     actor = _make_actor(env)
     dynamics = _make_dynamics(env)
-    critic = build_mlp(env.rep.rep_state_dim + NUM_ACTIONS + 5, (256, 128), 1).to(env.device)
+    critic = build_mlp(env.rep.rep_state_dim + NUM_ACTIONS + (1 if env.quarter else 5), (256, 128), 1).to(env.device)
     world_cfg = WorldModelLearnerCfg(
         horizon=MODEL_HORIZON, batch_size=batch_size, num_batches=1 if smoke else 10,
         nominal_error_body_avel=1.0,  # rad/s, the evaluation yaw command magnitude
@@ -522,7 +607,7 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
         with torch.no_grad():
             actor.train()
             actor.update_normalization(
-                observations(env.rep.represent(starts["state"]), starts["prev_action"], starts)
+                env.observe(env.rep.represent(starts["state"]), starts["prev_action"], starts)
             )
         policy_stats = actor_learner.update([starts])
         if env.yaw_reward == "huber":
@@ -560,13 +645,13 @@ def main() -> None:
     parser.add_argument("--report-every", type=int, metavar="N",
                         help="Report real replay yaw coverage and evaluate the policy every N iterations")
     parser.add_argument("--actor-horizon", type=int, help="Imagined control steps per actor update")
-    parser.add_argument("--yaw-reward", choices=("clipped", "huber", "turn"), default="clipped")
+    parser.add_argument("--yaw-reward", choices=("clipped", "huber", "turn", "quarter"), default="clipped")
     parser.add_argument("--world-model-loss", choices=("original", "angular-velocity"), default="angular-velocity")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smoke", action="store_true", help="Run a bounded end-to-end check")
     parser.add_argument("--output", type=Path, help="Write a new checkpoint at this path")
     parser.add_argument("--evaluate", type=Path, help="Evaluate one checkpoint on both tasks")
-    parser.add_argument("--video-dir", type=Path, help="Export three MP4s during checkpoint evaluation")
+    parser.add_argument("--video-dir", type=Path, help="Export MP4s during checkpoint evaluation")
     parser.add_argument("--cube-mm", type=int, choices=(36, 42),
                         help="Training cube edge length (default 36 mm); evaluation uses checkpoint geometry")
     parser.add_argument("--model-replay", choices=("recent", "history"), default="recent",
@@ -600,7 +685,7 @@ def main() -> None:
     if args.device == "cpu":
         torch.set_num_threads(min(4, torch.get_num_threads()))
     checkpoint = None
-    cube_mm = args.cube_mm or 36
+    cube_mm = args.cube_mm or (42 if args.yaw_reward == "quarter" else 36)
     if args.evaluate:
         checkpoint = torch.load(args.evaluate, map_location=args.device, weights_only=True)
         cube_mm = checkpoint.get("cube_mm", 36)
@@ -619,7 +704,10 @@ def main() -> None:
         if args.video_dir:
             from superdex.video import EvaluationClips
             capture = EvaluationClips(env)
-        _log("checkpoint_policy", evaluate(env, actor, args.eval_steps or (400 if env.yaw_reward == "turn" else 150), capture=capture))
+        default_eval = round(QUARTER_CONTROL_SECONDS / env.dt) if env.quarter else (
+            400 if env.yaw_reward == "turn" else 150
+        )
+        _log("checkpoint_policy", evaluate(env, actor, args.eval_steps or default_eval, capture=capture))
         if capture is not None:
             capture.write(args.video_dir)
     else:

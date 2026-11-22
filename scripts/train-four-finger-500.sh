@@ -16,6 +16,9 @@ suffix=""
 if [[ "$yaw_reward" == turn ]]; then
   eval_steps=400
   suffix="-turn"
+elif [[ "$yaw_reward" == quarter ]]; then
+  eval_steps=200
+  suffix="-quarter"
 fi
 root=/mnt/data1/sra/medhansh/superdex
 export TMPDIR="$root/tmp" XDG_CACHE_HOME="$root/cache"
