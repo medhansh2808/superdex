@@ -41,6 +41,22 @@ _FOUR_FINGER_CUBE_POSE = (
     -0.0127527643, 0.1089376904, 0.2278207899,
     0.9640271150, -0.1866893753, -0.1699634375, -0.0831337989,
 )
+# Native MuJoCo fingertip fit and preload, settled under gravity on the 50 mm cube.
+_LARGE_GRASP_JOINTS = (
+    .705718920, -.060475815, .849847311, .630251194,
+    .877872553, -.148952272, .473054291, .510161907,
+    .917692950, -.348934501, .564593420, .355747025,
+    1.381313683, 1.101062093, .664923502, .510710642,
+)
+_LARGE_GRASP_TARGETS = (
+    .760392923, -.048313460, .890197916, .650930673,
+    .962534086, .019346977, .579930602, .582263859,
+    .945703377, -.512809184, .523518122, .338731796,
+    1.329353175, 1.024531655, .663715622, .509234244,
+)
+_LARGE_GRASP_CUBE_POSE = (
+    -.017966780, .116455499, .226740513, .957845003, -.213374636, -.191258016, .020605491,
+)
 _TIP_NAMES = ("if_tip", "mf_tip", "rf_tip", "th_tip")
 _HOLD_SECONDS = 2.0
 _RELEASE_SECONDS = 0.8
@@ -62,11 +78,21 @@ def reset_grasp(model: mujoco.MjModel, data: mujoco.MjData) -> None:
     joints, targets, pose = _GRASP_JOINTS, _GRASP_TARGETS, _GRASP_CUBE_POSE
     if np.isclose(model.geom("cube/surface").size[0], 0.021):
         joints, targets, pose = _FOUR_FINGER_JOINTS, _FOUR_FINGER_TARGETS, _FOUR_FINGER_CUBE_POSE
+    elif np.isclose(model.geom("cube/surface").size[0], 0.025):
+        joints, targets, pose = _LARGE_GRASP_JOINTS, _LARGE_GRASP_TARGETS, _LARGE_GRASP_CUBE_POSE
     data.qpos[joint_addresses] = joints
     data.ctrl[actuator_ids] = targets
     data.qpos[cube_address : cube_address + 7] = pose
     mujoco.mj_normalizeQuat(model, data.qpos)
     mujoco.mj_forward(model, data)
+
+
+def _release_targets(model: mujoco.MjModel) -> np.ndarray:
+    targets = np.zeros(model.nu)
+    if np.isclose(model.geom("cube/surface").size[0], 0.025):
+        targets[model.actuator("th_cmc_act").id] = -.349
+        targets[model.actuator("th_mcp_act").id] = 1.65
+    return targets
 
 
 def _rollout(model: mujoco.MjModel, data: mujoco.MjData) -> tuple[np.ndarray, int]:
@@ -98,7 +124,7 @@ def _rollout(model: mujoco.MjModel, data: mujoco.MjData) -> tuple[np.ndarray, in
     rows = [sample()]
     advance(_HOLD_SECONDS)
     hold_samples = len(rows)
-    data.ctrl[:] = 0
+    data.ctrl[:] = _release_targets(model)
     advance(_RELEASE_SECONDS)
     return np.stack(rows), hold_samples
 
@@ -121,8 +147,8 @@ def check_grasp(trace_path: Path | None = None, cube_mm: int = 36) -> None:
             writer.writerow(_TRACE_COLUMNS)
             writer.writerows(trace)
 
-    if cube_mm == 42 and not np.all(hold[:, -4:]):
-        raise RuntimeError("42 mm grasp lost fingertip contact during the hold")
+    if cube_mm in (42, 50) and not np.all(hold[:, -4:]):
+        raise RuntimeError(f"{cube_mm} mm grasp lost fingertip contact during the hold")
     if drift > _MAX_HOLD_DRIFT or not np.all(supported[1:]):
         raise RuntimeError(f"Cube grasp was unstable over the hold (drift {drift:.3f} m)")
     if drop < _MIN_RELEASE_DROP or np.any(trace[-1, -4:]):
@@ -182,14 +208,15 @@ def check_mjlab_grasp(device: str, num_envs: int, cube_mm: int = 36) -> None:
     if drift > _MAX_HOLD_DRIFT:
         raise RuntimeError(f"mjlab grasp was unstable on {device} (drift {drift:.3f} m)")
 
-    ctrl[::2] = 0
+    release = torch.as_tensor(_release_targets(model), dtype=ctrl.dtype, device=device)
+    ctrl[::2] = release
     first_release = advance(_RELEASE_SECONDS)
     drop = (held[-1, ::2, 2] - first_release[-1, ::2, 2]).min().item()
     retained = torch.linalg.vector_norm(first_release[:, 1::2] - origin[1::2], dim=-1)
     if drop < _MIN_RELEASE_DROP or retained.max().item() > _MAX_HOLD_DRIFT:
         raise RuntimeError(f"mjlab independent release failed on {device} (drop {drop:.3f} m)")
 
-    ctrl[1::2] = 0
+    ctrl[1::2] = release
     second_release = advance(_RELEASE_SECONDS)
     remaining_drop = (first_release[-1, 1::2, 2] - second_release[-1, 1::2, 2]).min().item()
     if remaining_drop < _MIN_RELEASE_DROP:
@@ -207,7 +234,7 @@ def main() -> None:
     parser.add_argument("--trace", type=Path, help="Write joint, cube and contact samples to CSV")
     parser.add_argument("--mjlab-device", help="Also check batched grasps on cpu or CUDA")
     parser.add_argument("--mjlab-envs", type=int, default=2, help="Number of mjlab worlds")
-    parser.add_argument("--cube-mm", choices=(36, 42), type=int, default=36)
+    parser.add_argument("--cube-mm", choices=(36, 42, 50), type=int, default=36)
     args = parser.parse_args()
     check_grasp(args.trace, args.cube_mm)
     if args.mjlab_device:

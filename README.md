@@ -102,3 +102,27 @@ at least two fingertips, for the final uninterrupted second with at most 2 mm
 of drift. The summary reports
 stable starts, face arrival, hold duration, drops and success for each direction.
 Checkpoint replay includes the initial hold and exports one clip per command.
+
+### 50 mm demonstration reset experiment
+
+The optional demonstration bank uses the 50 mm shards from the public
+[in-hand-rotation-mjlab v2.0 release](https://github.com/Msornerrrr/in-hand-rotation-mjlab/releases/tag/v2.0).
+With the training venv active and `src` on `PYTHONPATH`, build it with
+`python -m superdex.demonstrations reorient_demos.tar.gz reset-bank.npz`.
+The fitter uses signed yaw progress and joint motion from successful source
+segments to seed right-hand fingertip fits. It holds each fit for one second
+under gravity and records the source shard, world and frame. Training repeats
+the hold on its own device and filters out resets that slip.
+
+Run `bash scripts/train-four-finger-500.sh history quarter 50` for the baseline
+and append the bank path for the demonstration variant. Both evaluate from the
+calibrated face-1 grasp. The demonstration run samples the surviving bank for
+half of its training resets. World-model targets come from the simulator in
+both runs. Set `SUPERDEX_ITERATIONS`, `SUPERDEX_SEED`, or
+`SUPERDEX_ACTOR_HORIZON` to override the corresponding launcher defaults.
+Compare the two task success rates at matched simulator steps and seeds.
+
+Use `python -m superdex.diagnose /path/to/joint.pt` to compare predictions
+against measured fingertip support and geometric drop at 1, 4, 8, 16 and
+32 steps. Predicted fingertip support is a contact query at the predicted
+pose. The actor's termination signal uses the existing displacement rule.

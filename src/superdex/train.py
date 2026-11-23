@@ -153,9 +153,83 @@ class YawCoverage:
         return result
 
 
+class DemoResets:
+    """Sample validated resets without consuming the learner's random stream."""
+
+    def __init__(self, path: Path, env: CubeManipulation, seed: int):
+        import numpy as np
+
+        with np.load(path, allow_pickle=False) as bank:
+            if int(bank["cube_mm"]) != env.cube_mm:
+                raise ValueError("Demonstration bank cube size does not match the scene")
+            self.pose = torch.as_tensor(bank["pose"], device=env.device, dtype=env._qpos.dtype)
+            self.control = torch.as_tensor(bank["control"], device=env.device, dtype=env._ctrl.dtype)
+            directions = torch.as_tensor(bank["direction"], device=env.device)
+        if (directions.ndim != 1 or self.pose.shape != (len(directions), env._qpos.shape[-1])
+                or self.control.shape != (len(directions), env._ctrl.shape[-1])):
+            raise ValueError("Invalid demonstration bank dimensions")
+        self.rows = [(directions == sign).nonzero(as_tuple=True)[0] for sign in (1, -1)]
+        if not all(len(rows) for rows in self.rows) or not ((directions == 1) | (directions == -1)).all():
+            raise ValueError("Demonstration bank must contain both directions")
+        if not self.pose.isfinite().all() or not self.control.isfinite().all():
+            raise ValueError("Demonstration bank must contain finite states and controls")
+        model = env.sim.mj_model
+        joint_ids = [model.actuator_trnid[actuator, 0] for actuator in env._actuators]
+        limits = self.pose.new_tensor(model.jnt_range[joint_ids])
+        if ((self.pose[:, env._joint_pos] < limits[:, 0] - .005)
+                | (self.pose[:, env._joint_pos] > limits[:, 1] + .005)).any():
+            raise ValueError("Demonstration reset violates the scene's joint limits")
+        norm = self.pose[:, env._cube_pose][:, 3:].norm(dim=-1)
+        action = (self.control[:, env._actuators] - env.action_offset) / ACTION_SCALE
+        if not torch.allclose(norm, torch.ones_like(norm), atol=1e-4):
+            raise ValueError("Demonstration reset cube quaternion must be normalized")
+        if not torch.allclose(action, env.bound_action(action), atol=1e-5):
+            raise ValueError("Demonstration reset control is outside the policy's action range")
+        valid = self.validate(env, action)
+        self.rows = [rows[valid[rows]] for rows in self.rows]
+        if not all(len(rows) for rows in self.rows):
+            raise ValueError("No demonstration reset in one direction passed the hold check on this device")
+        _log("demo_bank", {"file": str(path), "passed": {
+            name: len(rows) for name, rows in zip(env.task_names, self.rows, strict=True)
+        }, "rejected": int((~valid).sum())})
+        self.rng = torch.Generator(device=env.device).manual_seed(seed)
+        self.counts = torch.zeros(2, device=env.device, dtype=torch.long)
+
+    @torch.no_grad()
+    def validate(self, env, actions):
+        results = []
+        for start in range(0, len(self.pose), env.num_envs):
+            count = min(len(self.pose) - start, env.num_envs)
+            # Pad the last batch to the fixed simulator world count.
+            rows = start + env.ids.clamp(max=count - 1)
+            initial = env.reset(env.ids, pose=self.pose[rows], control=self.control[rows])
+            result = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
+            for _ in range(env.hold_steps):
+                state = env.step(actions[rows])
+                drift = (state[:, CUBE_POSITION] - initial[:, CUBE_POSITION]).norm(dim=-1)
+                turn = orientation_error(state[:, CUBE_ORIENTATION], initial[:, CUBE_ORIENTATION])
+                result &= ((env.fingertip_contacts() >= 2) & (drift <= .002)
+                           & (turn <= math.radians(3)) & (env.drop_error(state) <= 1))
+            results.append(result[:count])
+        return torch.cat(results)
+
+    def reset(self, env, ids):
+        selected = torch.rand(len(ids), device=env.device, generator=self.rng) < .5
+        tasks = env.task_id[ids]
+        row = torch.zeros_like(ids)
+        for task_id, pool in enumerate(self.rows):
+            draw = torch.randint(len(pool), (len(ids),), device=env.device, generator=self.rng)
+            row = torch.where(tasks == task_id, pool[draw], row)
+        pose = torch.where(selected[:, None], self.pose[row], env._reset_pos)
+        control = torch.where(selected[:, None], self.control[row], env._reset_ctrl)
+        self.counts.index_add_(0, tasks, selected.long())
+        return env.reset(ids, pose=pose, control=control), selected, control
+
+
 class Collector:
-    def __init__(self, env: CubeManipulation) -> None:
+    def __init__(self, env: CubeManipulation, demo_resets: DemoResets | None = None) -> None:
         self.env = env
+        self.demo_resets = demo_resets
         self.state = env.reset()
         self.goals = env.goals(env.ids)
         self.prev_action = self.state.new_zeros((env.num_envs, NUM_ACTIONS))
@@ -167,6 +241,22 @@ class Collector:
         self.episode_steps = round(control_seconds / env.dt)
         if env.quarter:
             self.initial_hold = torch.zeros_like(self.age)
+        if self.demo_resets is not None:
+            self.reset_episodes(env.ids)
+
+    def reset_episodes(self, ids):
+        env = self.env
+        if self.demo_resets is None:
+            self.state = env.reset(ids)
+            self.prev_action[ids] = 0
+            if env.quarter:
+                self.initial_hold[ids] = 0
+        else:
+            self.state, selected, control = self.demo_resets.reset(env, ids)
+            self.prev_action[ids] = (control[:, env._actuators] - env.action_offset) / ACTION_SCALE
+            self.initial_hold[ids] = selected.long() * env.hold_steps
+        self.age[ids] = 0
+        self.goals[ids] = env.goals(ids)
 
     @torch.no_grad()
     def collect(
@@ -234,12 +324,7 @@ class Collector:
             self.state, self.prev_action = next_state, action
             ended = (terminated | truncated).nonzero(as_tuple=True)[0]
             if ended.numel():
-                self.state = env.reset(ended)
-                self.goals[ended] = env.goals(ended)
-                self.age[ended] = 0
-                self.prev_action[ended] = 0
-                if env.quarter:
-                    self.initial_hold[ended] = 0
+                self.reset_episodes(ended)
         return torch.stack(states), torch.stack(actions)
 
 
@@ -567,6 +652,7 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
             "actor_horizon": actor_horizon, "policy_noise_std": args.policy_noise_std,
             "world_model_loss": args.world_model_loss, "yaw_reward": args.yaw_reward,
             "model_replay": args.model_replay,
+            "demo_bank": args.demo_bank.name if args.demo_bank else None,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         with TemporaryDirectory(dir=path.parent) as tmp:
@@ -582,7 +668,8 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
     if args.model_replay == "history":
         archive = JointReplay(env, min(16384, warmup_steps + iterations * collect_steps))
     _log("model_replay", {"mode": args.model_replay})
-    collector = Collector(env)
+    demo_resets = DemoResets(args.demo_bank, env, args.seed) if args.demo_bank else None
+    collector = Collector(env, demo_resets)
     states, actions = collector.collect(warmup_steps, replay, archive=archive)
     world_learner.update_normalization(states, actions)
     _log("world_model_heldout_before", _world_model_errors(env, dynamics, validation))
@@ -617,6 +704,10 @@ def train(args: argparse.Namespace, env: CubeManipulation) -> None:
         stats = {k: v.item() for k, v in (model_stats | policy_stats).items()}
         _log(f"iteration {i}/{iterations}", stats)
         if args.report_every and (i % args.report_every == 0 or i == iterations):
+            if demo_resets is not None:
+                _log("demo_resets", {"iteration": i, **dict(zip(
+                    env.task_names, demo_resets.counts.tolist(), strict=True
+                ))})
             _log("replay_yaw", {"iteration": i, **collector.coverage.report()})
             if i < iterations:
                 _log("world_model_heldout", {"iteration": i, **_world_model_errors(env, dynamics, validation)})
@@ -652,13 +743,17 @@ def main() -> None:
     parser.add_argument("--output", type=Path, help="Write a new checkpoint at this path")
     parser.add_argument("--evaluate", type=Path, help="Evaluate one checkpoint on both tasks")
     parser.add_argument("--video-dir", type=Path, help="Export MP4s during checkpoint evaluation")
-    parser.add_argument("--cube-mm", type=int, choices=(36, 42),
+    parser.add_argument("--cube-mm", type=int, choices=(36, 42, 50),
                         help="Training cube edge length (default 36 mm); evaluation uses checkpoint geometry")
     parser.add_argument("--model-replay", choices=("recent", "history"), default="recent",
                         help="Use original recent replay or mix recent and historical measured transitions")
+    parser.add_argument("--demo-bank", type=Path,
+                        help="Use validated intermediate poses for half of the 50 mm quarter-turn training resets")
     parser.add_argument("--save-reports", action="store_true",
                         help="Save the actor, world model and critic at every intermediate evaluation")
     args = parser.parse_args()
+    if args.demo_bank and (args.evaluate or args.yaw_reward != "quarter" or args.cube_mm != 50):
+        parser.error("--demo-bank requires training with --yaw-reward quarter --cube-mm 50")
     if args.save_reports and (not args.output or not args.report_every or args.evaluate):
         parser.error("--save-reports requires training with --output and --report-every")
     if args.video_dir and not args.evaluate:

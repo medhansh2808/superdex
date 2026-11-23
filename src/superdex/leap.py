@@ -34,7 +34,7 @@ def leap_spec() -> mujoco.MjSpec:
 
 
 def cube_spec(cube_mm: int = 36) -> mujoco.MjSpec:
-    if cube_mm not in (36, 42):
+    if cube_mm not in (36, 42, 50):
         raise ValueError(f"No calibrated grasp for a {cube_mm} mm cube")
     half_edge = cube_mm / 2000
     spec = mujoco.MjSpec()

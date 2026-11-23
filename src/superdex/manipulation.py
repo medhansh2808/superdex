@@ -116,8 +116,8 @@ class CubeManipulation:
         yaw_reward: str = "clipped", cube_mm: int = 36,
     ) -> None:
         self.quarter = yaw_reward == "quarter"
-        if self.quarter and cube_mm != 42:
-            raise ValueError("The quarter-turn task requires the calibrated 42 mm grasp")
+        if self.quarter and cube_mm not in (42, 50):
+            raise ValueError("The quarter-turn task requires a calibrated four-finger grasp (42 or 50 mm)")
         self.task_names = QUARTER_TASKS if self.quarter else TASKS
         self.cube_mm = cube_mm
         self.yaw_reward = yaw_reward
@@ -185,12 +185,14 @@ class CubeManipulation:
             dim=-1,
         )
 
-    def reset(self, ids: torch.Tensor | None = None) -> torch.Tensor:
+    def reset(
+        self, ids: torch.Tensor | None = None, *, pose=None, control=None,
+    ) -> torch.Tensor:
         self.sim.reset(ids)
         ids = slice(None) if ids is None else ids
-        self._qpos[ids] = self._reset_pos
+        self._qpos[ids] = self._reset_pos if pose is None else pose
         self._qvel[ids] = 0
-        self._ctrl[ids] = self._reset_ctrl
+        self._ctrl[ids] = self._reset_ctrl if control is None else control
         self.sim.forward()
         return self.state()
 
